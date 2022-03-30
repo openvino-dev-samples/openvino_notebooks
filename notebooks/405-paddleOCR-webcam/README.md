@@ -1,6 +1,7 @@
 # PaddleOCR with OpenVINO
 
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/openvinotoolkit/openvino_notebooks/HEAD?filepath=notebooks%2F001-hello-world%2F001-hello-world.ipynb)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/OpenVINO-dev-contest/openvino_notebooks/PaddlePaddle?labpath=notebooks%2F405-paddleOCR-webcam%2F405-paddleOCR-webcam.ipynb
+)
 
 <p align="center" width="100%">
     <img width="80%" src="https://raw.githubusercontent.com/yoyowz/classification/master/images/ezgif.com-gif-maker.gif"> 
