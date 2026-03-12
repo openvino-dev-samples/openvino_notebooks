@@ -533,6 +533,9 @@ def patch_cuda_for_cpu():
     ]:
         _ensure_mock(mod, attrs)
 
+    # gsplat — CUDA-only Gaussian splatting renderer ─────────────────
+    _ensure_mock("gsplat", {"rasterization": _noop})
+
     # 2. Monkey-patch ``set_attention_backend`` so it never touches CUDA
     import sam3d_objects.pipeline.inference_pipeline as _ip_mod  # noqa: E402
 
@@ -756,6 +759,52 @@ def cpu_autocast():
 # 2.  OV CONVERSION WRAPPERS — nn.Modules designed for ``ov.convert_model``
 # ============================================================================
 
+class DinoBackboneForOV(nn.Module):
+    """
+    Unified DINOv2 backbone wrapper for OpenVINO conversion.
+
+    All four DINOv2 embedders (SS-image, SS-mask, SLat-image, SLat-mask) share
+    identical ViT-L/14 weights.  This wrapper exports a **single** OV model
+    with TWO outputs, covering both the SS stage (postnorm) and the SLat stage
+    (prenorm):
+
+        Output 0 — postnorm: ``cat(x_norm_clstoken, x_norm_patchtokens)``
+        Output 1 — prenorm:  ``layer_norm(x_prenorm)``
+
+    Input must already be 3-channel; for mask inputs the caller repeats 1→3
+    channels before calling this model.
+
+    Handles: resize → normalize → ViT forward_features → dual output.
+    """
+
+    def __init__(self, dino):
+        super().__init__()
+        self.backbone = dino.backbone
+        self.register_buffer("mean", dino.mean.clone())
+        self.register_buffer("std", dino.std.clone())
+        self.resize_size = dino.resize_input_size
+        self.do_normalize = dino.normalize_images
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor):
+        x = F.interpolate(x, size=self.resize_size, mode="bilinear",
+                          align_corners=False)
+        if self.do_normalize:
+            x = (x - self.mean) / self.std
+        output = self.backbone.forward_features(x)
+        # Output 0: postnorm (for SS stage, prenorm=False)
+        postnorm = torch.cat(
+            [output["x_norm_clstoken"].unsqueeze(1),
+             output["x_norm_patchtokens"]],
+            dim=1,
+        )
+        # Output 1: prenorm (for SLat stage, prenorm=True)
+        features = output["x_prenorm"]
+        prenorm = F.layer_norm(features, features.shape[-1:])
+        return postnorm, prenorm
+
+
+# Keep the old per-variant wrappers for backward compatibility / fallback
 class DinoImageForOV(nn.Module):
     """
     Wraps a ``Dino`` embedder for 3-channel image input.
@@ -1368,6 +1417,34 @@ def convert_dino_mask(
     return ov_model
 
 
+def convert_dino_backbone(
+    dino_model,
+    output_path: Union[str, Path],
+    input_shape: Tuple[int, ...] = (1, 3, 518, 518),
+) -> ov.Model:
+    """
+    Convert the **shared** DINOv2 backbone to a single OpenVINO IR with
+    two outputs (postnorm, prenorm).
+
+    All four DINOv2 embedders share identical ViT-L/14 weights.
+    This function exports ONE model (~1.2 GB) instead of four copies.
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
+        return ov.Core().read_model(str(output_path))
+
+    wrapper = DinoBackboneForOV(dino_model).eval().float()
+    example_input = torch.randn(input_shape, dtype=torch.float32)
+    with torch.no_grad():
+        ov_model = ov.convert_model(wrapper, example_input=example_input)
+    ov.save_model(ov_model, str(output_path))
+    print(f"[OV-SAM3D] Saved merged DINOv2 backbone → {output_path}")
+    del wrapper
+    _cleanup()
+    return ov_model
+
+
 def convert_ss_decoder(
     ss_decoder,
     output_path: Union[str, Path],
@@ -1602,33 +1679,14 @@ def convert_all_models(
     core = ov.Core()
     compiled = {}
 
-    # ── SS condition embedder: DINOv2 for image ────────────────────────
+    # ── Merged DINOv2 backbone (shared across all 4 embedders) ─────────
+    # All four DINOv2 embedders (SS-image, SS-mask, SLat-image, SLat-mask)
+    # share identical ViT-L/14 weights.  Convert once → ~3.6 GB savings.
     ss_embedder = pipeline.condition_embedders["ss_condition_embedder"]
-    # embedder_list[0] = (Dino_for_image, kwargs_info)
-    # embedder_list[1] = (Dino_for_mask, kwargs_info)
-    ss_dino_image = ss_embedder.embedder_list[0][0]
-    ss_dino_mask = ss_embedder.embedder_list[1][0]
-
-    print("[OV-SAM3D] Converting SS DINOv2 image embedder …")
-    ov_m = convert_dino_image(ss_dino_image, output_dir / "ss_dino_image.xml")
-    compiled["ss_dino_image_ov"] = core.compile_model(ov_m, device)
-
-    print("[OV-SAM3D] Converting SS DINOv2 mask embedder …")
-    ov_m = convert_dino_mask(ss_dino_mask, output_dir / "ss_dino_mask.xml")
-    compiled["ss_dino_mask_ov"] = core.compile_model(ov_m, device)
-
-    # ── SLat condition embedder: DINOv2 (with prenorm) ─────────────────
-    slat_embedder = pipeline.condition_embedders["slat_condition_embedder"]
-    slat_dino_image = slat_embedder.embedder_list[0][0]
-    slat_dino_mask = slat_embedder.embedder_list[1][0]
-
-    print("[OV-SAM3D] Converting SLat DINOv2 image embedder …")
-    ov_m = convert_dino_image(slat_dino_image, output_dir / "slat_dino_image.xml")
-    compiled["slat_dino_image_ov"] = core.compile_model(ov_m, device)
-
-    print("[OV-SAM3D] Converting SLat DINOv2 mask embedder …")
-    ov_m = convert_dino_mask(slat_dino_mask, output_dir / "slat_dino_mask.xml")
-    compiled["slat_dino_mask_ov"] = core.compile_model(ov_m, device)
+    ss_dino_image = ss_embedder.embedder_list[0][0]   # any of the 4 will do
+    print("[OV-SAM3D] Converting merged DINOv2 backbone (1 model for all 4 embedders) …")
+    ov_m = convert_dino_backbone(ss_dino_image, output_dir / "dino_backbone.xml")
+    compiled["dino_backbone_ov"] = core.compile_model(ov_m, device)
 
     # ── SS decoder ─────────────────────────────────────────────────────
     print("[OV-SAM3D] Converting SS decoder …")
@@ -1707,23 +1765,39 @@ class OVDinoEmbedder:
     """
     Replaces a ``Dino`` nn.Module with an OpenVINO compiled-model wrapper.
 
+    Works with the **merged** DINOv2 backbone that has two outputs:
+        Output 0 — postnorm (for SS stage, prenorm=False)
+        Output 1 — prenorm  (for SLat stage, prenorm=True)
+
+    For mask inputs, repeats 1-channel → 3-channel before calling the model.
+
     Preserves the same ``__call__(x) → tokens`` API expected by ``EmbedderFuser``.
     """
 
-    def __init__(self, compiled_model: ov.CompiledModel, embed_dim: int, is_mask: bool = False):
+    def __init__(
+        self,
+        compiled_model: ov.CompiledModel,
+        embed_dim: int,
+        is_mask: bool = False,
+        prenorm: bool = False,
+    ):
         self.compiled_model = compiled_model
         self.embed_dim = embed_dim
         self.is_mask = is_mask
+        self.prenorm = prenorm  # True → SLat stage (output 1), False → SS stage (output 0)
+        self._output_index = 1 if prenorm else 0
         self._infer_request = compiled_model.create_infer_request()
 
     def __call__(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         orig_dtype = x.dtype
         orig_device = x.device
-        # The OV mask model (DinoMaskForOV) already handles 1→3 channel repeat
-        # internally, so just pass the raw input through.
+        # For mask inputs the merged backbone expects 3-channel input,
+        # so repeat 1ch → 3ch here rather than inside the OV graph.
+        if self.is_mask and x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
         x_np = x.float().detach().cpu().numpy()
         self._infer_request.infer(x_np)
-        out_np = self._infer_request.get_output_tensor(0).data
+        out_np = self._infer_request.get_output_tensor(self._output_index).data
         return torch.from_numpy(out_np.copy()).to(dtype=orig_dtype, device=orig_device)
 
     def eval(self):
@@ -1857,6 +1931,26 @@ class OVMoGe:
         return torch.from_numpy(out_np.copy())
 
 
+class OVEmbedderProjection(nn.Module):
+    """
+    Replaces an ``EmbedderFuser`` projection net (LayerNorm → FeedForward)
+    with an OV compiled model.
+
+    ``(B, L, embed_dim) → (B, L, output_dim)``
+    """
+
+    def __init__(self, compiled_model: ov.CompiledModel):
+        super().__init__()
+        self.compiled_model = compiled_model
+        self._infer_request = compiled_model.create_infer_request()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_np = x.float().detach().cpu().numpy()
+        self._infer_request.infer(x_np)
+        out_np = self._infer_request.get_output_tensor(0).data
+        return torch.from_numpy(out_np.copy()).to(dtype=x.dtype, device=x.device)
+
+
 # ============================================================================
 # 5.  OV PIPELINE — modified InferencePipelinePointMap that uses OV models
 # ============================================================================
@@ -1904,7 +1998,71 @@ class OVInferencePipelinePointMap:
     #  Internal patching
     # ------------------------------------------------------------------
     def _patch_embedders(self):
-        """Replace DINOv2 embedder modules in EmbedderFusers with OV wrappers."""
+        """Replace DINOv2 embedder modules in EmbedderFusers with OV wrappers.
+
+        Uses the single merged DINOv2 backbone (``dino_backbone_ov``) for all
+        four embedders, selecting the appropriate output index:
+            SS  stage → output 0 (postnorm, prenorm=False)
+            SLat stage → output 1 (prenorm,  prenorm=True)
+        """
+        if "dino_backbone_ov" not in self._compiled:
+            # Fall back to per-model keys for backward compatibility
+            self._patch_embedders_legacy()
+            return
+
+        backbone_compiled = self._compiled["dino_backbone_ov"]
+
+        # SS condition embedder (prenorm=False → output index 0)
+        ss_emb = self._pipeline.condition_embedders["ss_condition_embedder"]
+        img_dino = ss_emb.embedder_list[0][0]
+        ss_emb.embedder_list[0] = (
+            OVDinoEmbedder(backbone_compiled, img_dino.embed_dim,
+                           is_mask=False, prenorm=False),
+            ss_emb.embedder_list[0][1],
+        )
+        ss_emb.module_list[0] = nn.Identity()
+
+        mask_dino = ss_emb.embedder_list[1][0]
+        ss_emb.embedder_list[1] = (
+            OVDinoEmbedder(backbone_compiled, mask_dino.embed_dim,
+                           is_mask=True, prenorm=False),
+            ss_emb.embedder_list[1][1],
+        )
+        ss_emb.module_list[1] = nn.Identity()
+
+        # SLat condition embedder (prenorm=True → output index 1)
+        slat_emb = self._pipeline.condition_embedders["slat_condition_embedder"]
+        img_dino = slat_emb.embedder_list[0][0]
+        slat_emb.embedder_list[0] = (
+            OVDinoEmbedder(backbone_compiled, img_dino.embed_dim,
+                           is_mask=False, prenorm=True),
+            slat_emb.embedder_list[0][1],
+        )
+        slat_emb.module_list[0] = nn.Identity()
+
+        mask_dino = slat_emb.embedder_list[1][0]
+        slat_emb.embedder_list[1] = (
+            OVDinoEmbedder(backbone_compiled, mask_dino.embed_dim,
+                           is_mask=True, prenorm=True),
+            slat_emb.embedder_list[1][1],
+        )
+        slat_emb.module_list[1] = nn.Identity()
+
+        # Patch projection nets
+        for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+            emb = self._pipeline.condition_embedders[stage_name]
+            if hasattr(emb, "projection_nets"):
+                for i, proj_net in enumerate(emb.projection_nets):
+                    proj_key = f"{stage_name}_proj_{i}_ov"
+                    if proj_key in self._compiled:
+                        emb.projection_nets[i] = OVEmbedderProjection(
+                            self._compiled[proj_key]
+                        )
+
+        print("[OV-SAM3D] DINOv2 embedders replaced with OV wrappers (merged backbone)")
+
+    def _patch_embedders_legacy(self):
+        """Legacy: patch using separate per-model DINOv2 OV files."""
         # SS condition embedder
         ss_emb = self._pipeline.condition_embedders["ss_condition_embedder"]
         if "ss_dino_image_ov" in self._compiled:
@@ -1913,9 +2071,10 @@ class OVInferencePipelinePointMap:
                 self._compiled["ss_dino_image_ov"],
                 embed_dim=img_dino.embed_dim,
                 is_mask=False,
+                prenorm=False,
             )
             ss_emb.embedder_list[0] = (ov_img, ss_emb.embedder_list[0][1])
-            ss_emb.module_list[0] = nn.Identity()  # placeholder in ModuleList
+            ss_emb.module_list[0] = nn.Identity()
 
         if "ss_dino_mask_ov" in self._compiled:
             mask_dino = ss_emb.embedder_list[1][0]
@@ -1923,6 +2082,7 @@ class OVInferencePipelinePointMap:
                 self._compiled["ss_dino_mask_ov"],
                 embed_dim=mask_dino.embed_dim,
                 is_mask=True,
+                prenorm=False,
             )
             ss_emb.embedder_list[1] = (ov_mask, ss_emb.embedder_list[1][1])
             ss_emb.module_list[1] = nn.Identity()
@@ -1935,6 +2095,7 @@ class OVInferencePipelinePointMap:
                 self._compiled["slat_dino_image_ov"],
                 embed_dim=img_dino.embed_dim,
                 is_mask=False,
+                prenorm=True,
             )
             slat_emb.embedder_list[0] = (ov_img, slat_emb.embedder_list[0][1])
             slat_emb.module_list[0] = nn.Identity()
@@ -1945,9 +2106,21 @@ class OVInferencePipelinePointMap:
                 self._compiled["slat_dino_mask_ov"],
                 embed_dim=mask_dino.embed_dim,
                 is_mask=True,
+                prenorm=True,
             )
             slat_emb.embedder_list[1] = (ov_mask, slat_emb.embedder_list[1][1])
             slat_emb.module_list[1] = nn.Identity()
+
+        # Patch projection nets
+        for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+            emb = self._pipeline.condition_embedders[stage_name]
+            if hasattr(emb, "projection_nets"):
+                for i, proj_net in enumerate(emb.projection_nets):
+                    proj_key = f"{stage_name}_proj_{i}_ov"
+                    if proj_key in self._compiled:
+                        emb.projection_nets[i] = OVEmbedderProjection(
+                            self._compiled[proj_key]
+                        )
 
         print("[OV-SAM3D] DINOv2 embedders replaced with OV wrappers")
 
@@ -2260,10 +2433,14 @@ def load_compiled_models(
     core = ov.Core()
     compiled = {}
     model_files = {
+        # Merged DINOv2 backbone (replaces 4 separate models)
+        "dino_backbone_ov": "dino_backbone.xml",
+        # Legacy per-model DINOv2 files (backward compatibility)
         "ss_dino_image_ov": "ss_dino_image.xml",
         "ss_dino_mask_ov": "ss_dino_mask.xml",
         "slat_dino_image_ov": "slat_dino_image.xml",
         "slat_dino_mask_ov": "slat_dino_mask.xml",
+        # Other models
         "ss_decoder_ov": "ss_decoder.xml",
         "ss_generator_ov": "ss_generator.xml",
         "slat_generator_core_ov": "slat_generator_core.xml",
