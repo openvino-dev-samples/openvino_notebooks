@@ -369,15 +369,104 @@ def patch_cuda_for_cpu():
         _ensure_mock(mod, attrs)
 
     # spconv — CUDA-only sparse convolution ——————————————————————————
-    _sp_conv_tensor = type("SparseConvTensor", (), {"__init__": _noop})
-    _sub_m_conv = type("SubMConv3d", (nn.Module,), {
-        "__init__": lambda self, *a, **kw: nn.Module.__init__(self),
-        "forward": lambda self, x: x,
-    })
+    class _MockSpConvTensor:
+        """Mock ``spconv.pytorch.SparseConvTensor`` that stores features/indices.
+
+        Critical: ``features`` is a property backed by ``_features`` so that
+        ``SparseTensor.replace()`` — which does ``new_data._features = feats``
+        — is immediately visible through ``new_data.features``.
+        """
+        def __init__(self, features=None, indices=None, spatial_shape=None,
+                     batch_size=None, grid=None, voxel_num=None,
+                     indice_dict=None, *args, **kwargs):
+            self._features = features
+            self.indices = indices
+            self.spatial_shape = spatial_shape if spatial_shape is not None else [64, 64, 64]
+            self.batch_size = batch_size if batch_size is not None else 1
+            self.grid = grid
+            self.voxel_num = voxel_num or 0
+            self.indice_dict = indice_dict or {}
+            self.benchmark = False
+            self.benchmark_record = {}
+            self.thrust_allocator = None
+            self._timer = None
+            self.force_algo = None
+            self.int8_scale = None
+
+        @property
+        def features(self):
+            return self._features
+
+        @features.setter
+        def features(self, value):
+            self._features = value
+
+        def replace_feature(self, new_features):
+            new = _MockSpConvTensor(
+                new_features, self.indices, self.spatial_shape, self.batch_size,
+                self.grid, self.voxel_num, self.indice_dict,
+            )
+            new.benchmark = self.benchmark
+            new.benchmark_record = self.benchmark_record
+            new.thrust_allocator = self.thrust_allocator
+            new._timer = self._timer
+            new.force_algo = self.force_algo
+            new.int8_scale = self.int8_scale
+            return new
+
+    class _CenterPixelConv3d(nn.Module):
+        """
+        Mock sparse 3-D convolution using **center-pixel approximation**.
+
+        Real spconv ``SubMConv3d`` applies a 3×3×3 kernel over spatial
+        neighbours;  this mock only uses the *center* kernel slice
+        ``weight[:, k//2, k//2, k//2, :]`` — equivalent to a pointwise
+        linear transform.  Channel dimensions change correctly, so the
+        U-Net encoder / decoder in the SLat generator can load checkpoint
+        weights and propagate matching feature shapes.
+
+        Weight layout (spconv convention):
+            ``(out_channels, k, k, k, in_channels)``
+        """
+        def __init__(self, in_channels, out_channels, kernel_size,
+                     stride=1, dilation=1, padding=None,
+                     bias=True, indice_key=None, algo=None):
+            super().__init__()
+            k = kernel_size if isinstance(kernel_size, (list, tuple)) else (kernel_size,) * 3
+            self.in_channels = in_channels
+            self.out_channels = out_channels
+            self.kernel_size = k
+            # Weight in spconv format: (out_ch, k, k, k, in_ch)
+            self.weight = nn.Parameter(torch.zeros(out_channels, *k, in_channels))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(out_channels))
+            else:
+                self.register_parameter("bias", None)
+
+        def forward(self, x):
+            """Centre-pixel pointwise convolution on ``_MockSpConvTensor``."""
+            features = x.features if hasattr(x, "features") else x
+            cx = self.kernel_size[0] // 2
+            cy = self.kernel_size[1] // 2
+            cz = self.kernel_size[2] // 2
+            center_w = self.weight[:, cx, cy, cz, :]          # (out_ch, in_ch)
+            # Maintain input dtype — the SLat U-Net runs in fp16
+            orig_dtype = features.dtype
+            out = F.linear(features.float(), center_w.float(),
+                           self.bias.float() if self.bias is not None else None)
+            out = out.to(orig_dtype)
+            if hasattr(x, "replace_feature"):
+                return x.replace_feature(out)
+            return out
+
+    _ConvAlgo = type("ConvAlgo", (), {"Native": None, "MaskImplicitGemm": None})
     _ensure_mock("spconv", None)
     _ensure_mock("spconv.pytorch", {
-        "SparseConvTensor": _sp_conv_tensor,
-        "SubMConv3d": _sub_m_conv,
+        "SparseConvTensor": _MockSpConvTensor,
+        "SubMConv3d": _CenterPixelConv3d,
+        "SparseConv3d": _CenterPixelConv3d,
+        "SparseInverseConv3d": _CenterPixelConv3d,
+        "ConvAlgo": _ConvAlgo,
     })
 
     # kaolin — CUDA-only 3D ops ——————————————————————————————————————
@@ -594,6 +683,38 @@ def patch_cuda_for_cpu():
         _IPPM.compute_pointmap = _compute_pointmap_cpu
     except Exception as _e:
         print(f"[OV-SAM3D] WARNING: could not patch compute_pointmap: {_e}")
+
+    # Patch Gaussian model to default to CPU instead of CUDA  ————————
+    try:
+        from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_model import Gaussian as _GaussianCls
+        _orig_gs_init = _GaussianCls.__init__
+
+        def _gaussian_cpu_init(self, *args, device="cpu", **kwargs):
+            return _orig_gs_init(self, *args, device="cpu", **kwargs)
+
+        def _setup_functions_cpu(self):
+            if self.scaling_activation_type == "exp":
+                self.scaling_activation = torch.exp
+                self.inverse_scaling_activation = torch.log
+            elif self.scaling_activation_type == "softplus":
+                self.scaling_activation = torch.nn.functional.softplus
+                from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_model import softplus_inverse_scaling_activation
+                self.inverse_scaling_activation = softplus_inverse_scaling_activation
+            from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.general_utils import inverse_sigmoid, build_scaling_rotation, strip_symmetric
+            self.covariance_activation = self.build_covariance_from_scaling_rotation
+            self.opacity_activation = torch.sigmoid
+            self.inverse_opacity_activation = inverse_sigmoid
+            self.rotation_activation = torch.nn.functional.normalize
+            # Use CPU instead of .cuda()
+            self.scale_bias = self.inverse_scaling_activation(torch.tensor(self.scaling_bias))
+            self.rots_bias = torch.zeros((4))
+            self.rots_bias[0] = 1
+            self.opacity_bias = self.inverse_opacity_activation(torch.tensor(self.opacity_bias))
+
+        _GaussianCls.__init__ = _gaussian_cpu_init
+        _GaussianCls.setup_functions = _setup_functions_cpu
+    except Exception:
+        pass
 
     print("[OV-SAM3D] CUDA patches applied — running on CPU / OpenVINO")
 
@@ -1598,11 +1719,9 @@ class OVDinoEmbedder:
     def __call__(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         orig_dtype = x.dtype
         orig_device = x.device
-        # Handle 1-channel mask input: repeat to 3 channels outside OV model
-        if self.is_mask and x.shape[1] == 1:
-            x_np = x.expand(-1, 3, -1, -1).float().detach().cpu().numpy()
-        else:
-            x_np = x.float().detach().cpu().numpy()
+        # The OV mask model (DinoMaskForOV) already handles 1→3 channel repeat
+        # internally, so just pass the raw input through.
+        x_np = x.float().detach().cpu().numpy()
         self._infer_request.infer(x_np)
         out_np = self._infer_request.get_output_tensor(0).data
         return torch.from_numpy(out_np.copy()).to(dtype=orig_dtype, device=orig_device)
@@ -1663,7 +1782,8 @@ class OVSSGenerator:
         ]
         self._infer_request.infer(inputs)
         outputs = []
-        for i in range(self._infer_request.model.outputs_size):
+        n_outputs = len(self.compiled_model.outputs)
+        for i in range(n_outputs):
             out_np = self._infer_request.get_output_tensor(i).data
             outputs.append(torch.from_numpy(out_np.copy()))
         return tuple(outputs)
@@ -1839,31 +1959,160 @@ class OVInferencePipelinePointMap:
             print("[OV-SAM3D] SS decoder replaced with OV wrapper")
 
     def _patch_ss_generator(self):
-        """Replace the SS generator backbone with OV wrapper."""
-        if "ss_generator_ov" in self._compiled:
-            ov_gen = OVSSGenerator(self._compiled["ss_generator_ov"])
-            # Store OV wrapper alongside original for the flow sampler
-            self._pipeline._ov_ss_generator = ov_gen
-            print("[OV-SAM3D] SS generator replaced with OV wrapper")
+        """Replace the SS generator backbone forward with OV model."""
+        if "ss_generator_ov" not in self._compiled:
+            return
+        ov_gen = OVSSGenerator(self._compiled["ss_generator_ov"])
+        backbone = _unwrap_to_backbone(self._pipeline.models["ss_generator"])
+
+        # Discover pose latent names from the backbone's config
+        pose_names = []
+        for _merged, names in backbone.latent_share_transformer.items():
+            pose_names = list(names)
+            break
+        orig_cond_emb = backbone.condition_embedder
+        force_zeros = backbone.force_zeros_cond
+
+        def _ov_forward(latents_dict, t, *cond_args, **cond_kwargs):
+            d = cond_kwargs.pop("d", None)
+            cfg_activate = cond_kwargs.pop("cfg", False)
+            if force_zeros and cfg_activate:
+                cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
+            else:
+                cond = orig_cond_emb(*cond_args, **cond_kwargs)
+            if d is None:
+                d = torch.zeros_like(t)
+            shape_latent = latents_dict["shape"]
+            pose_list = [latents_dict[name] for name in pose_names]
+            results = ov_gen(shape_latent, *pose_list, t, d, cond)
+            output = {"shape": results[0]}
+            for i, name in enumerate(pose_names):
+                output[name] = results[i + 1]
+            return output
+
+        backbone.forward = _ov_forward
+        self._pipeline._ov_ss_generator = ov_gen
+        print("[OV-SAM3D] SS generator backbone → OV")
 
     def _patch_slat_generator(self):
-        """Replace the SLat generator core transformer with OV wrapper."""
-        if "slat_generator_core_ov" in self._compiled:
-            ov_gen = OVSLatGeneratorCore(self._compiled["slat_generator_core_ov"])
-            self._pipeline._ov_slat_generator_core = ov_gen
-            print("[OV-SAM3D] SLat generator core replaced with OV wrapper")
+        """Replace the SLat generator core transformer blocks with OV model.
+
+        The SLat backbone is a U-Net:
+            input_layer → input_blocks (SparseResBlock3d) → 24 core blocks → out_blocks → out_layer
+
+        The input/output blocks use spconv (approximated by our centre-pixel
+        mock) and stay in PyTorch.  Only the 24 core
+        ``ModulatedSparseTransformerCrossBlock`` modules are replaced by a
+        single OV model.
+        """
+        if "slat_generator_core_ov" not in self._compiled:
+            return
+        ov_core = OVSLatGeneratorCore(self._compiled["slat_generator_core_ov"])
+        backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
+
+        # References to backbone components
+        orig_cond_emb = backbone.condition_embedder
+        force_zeros = backbone.force_zeros_cond
+        bb_dtype = backbone.dtype
+
+        # Import the project's SparseTensor for constructing internal tensors
+        from sam3d_objects.model.backbone.tdfy_dit.modules.sparse import SparseTensor as SPT
+
+        def _ov_forward(x, t, *cond_args, **cond_kwargs):
+            # ── Parse args exactly like SLatFlowModelTdfyWrapper.forward ──
+            d = cond_kwargs.pop("d", None)
+            if not torch.compiler.is_compiling():
+                if "coords" in cond_kwargs:
+                    coords_raw = cond_kwargs.pop("coords")
+                else:
+                    coords_raw = cond_args[-1]
+                    cond_args = cond_args[:-1]
+            else:
+                coords_raw = cond_args[-1]
+                cond_args = cond_args[:-1]
+            cfg_activate = cond_kwargs.pop("cfg", False)
+            coords = torch.tensor(coords_raw).to(x.device) if not isinstance(coords_raw, torch.Tensor) else coords_raw
+
+            # ── Condition embedding ──
+            if force_zeros and cfg_activate:
+                cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
+            else:
+                cond = orig_cond_emb(*cond_args, **cond_kwargs)
+
+            # ── Create SparseTensor (mirrors SLatFlowModelTdfyWrapper) ──
+            x_sparse = SPT(feats=x[0], coords=coords)
+
+            # ── SLatFlowModel.forward path ──
+            h = backbone.input_layer(x_sparse).type(bb_dtype)
+
+            t_emb = backbone.t_embedder(t)
+            if d is not None and hasattr(backbone, "d_embedder") and backbone.d_embedder is not None:
+                t_emb = t_emb + backbone.d_embedder(d)
+            if backbone.share_mod:
+                t_emb = backbone.adaLN_modulation(t_emb)
+            t_emb = t_emb.type(bb_dtype)
+            cond = cond.type(bb_dtype)
+
+            # ── Input blocks (PyTorch, centre-pixel spconv) ──
+            skips = []
+            for block in backbone.input_blocks:
+                h = block(h, t_emb)
+                skips.append(h.feats)
+
+            # ── Core transformer blocks → OV ──
+            h_feats = h.feats
+            if backbone.pe_mode == "ape":
+                h_feats = h_feats + backbone.pos_embedder(h.coords[:, 1:]).type(bb_dtype)
+            h_feats_out = ov_core(
+                h_feats.float(), h.coords[:, 1:].float(),
+                t_emb.float(), cond.float(),
+            )
+            h = h.replace(h_feats_out.type(bb_dtype))
+
+            # ── Output blocks (PyTorch, centre-pixel spconv) ──
+            for block, skip in zip(backbone.out_blocks, reversed(skips)):
+                if backbone.use_skip_connection:
+                    h = block(h.replace(torch.cat([h.feats, skip], dim=1)), t_emb)
+                else:
+                    h = block(h, t_emb)
+
+            # ── Final norm + output layer ──
+            h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+            h = backbone.out_layer(h.type(x_sparse.dtype))
+            return h.feats[None]
+
+        backbone.forward = _ov_forward
+        self._pipeline._ov_slat_generator_core = ov_core
+        print("[OV-SAM3D] SLat generator backbone → OV")
 
     def _patch_slat_decoders(self):
-        """Replace SLat decoders with OV wrappers."""
+        """Replace SLat decoder transformer blocks with OV models."""
         for key, compiled in self._compiled.items():
-            if key.startswith("slat_decoder_") and key.endswith("_ov"):
-                orig_key = key[:-3]  # Remove _ov suffix
-                ov_dec = OVSLatDecoder(compiled)
-                self._pipeline._ov_slat_decoders = getattr(
-                    self._pipeline, "_ov_slat_decoders", {}
-                )
-                self._pipeline._ov_slat_decoders[orig_key] = ov_dec
-                print(f"[OV-SAM3D] {orig_key} replaced with OV wrapper")
+            if not (key.startswith("slat_decoder_") and key.endswith("_ov")):
+                continue
+            orig_key = key[:-3]  # e.g. "slat_decoder_gs"
+            if orig_key not in self._pipeline.models:
+                continue
+            ov_dec = OVSLatDecoder(compiled)
+            decoder = self._pipeline.models[orig_key]
+            orig_to_rep = decoder.to_representation
+
+            def _make_ov_decoder_forward(_ov_dec, _orig_to_rep):
+                def _ov_forward(x_sparse):
+                    feats = x_sparse.feats
+                    coords = x_sparse.coords
+                    coords_xyz = coords[:, 1:].float()
+                    out_feats = _ov_dec(feats, coords_xyz)
+                    out_sparse = x_sparse.replace(out_feats)
+                    return _orig_to_rep(out_sparse)
+                return _ov_forward
+
+            decoder.forward = _make_ov_decoder_forward(ov_dec, orig_to_rep)
+            self._pipeline._ov_slat_decoders = getattr(
+                self._pipeline, "_ov_slat_decoders", {}
+            )
+            self._pipeline._ov_slat_decoders[orig_key] = ov_dec
+            print(f"[OV-SAM3D] {orig_key} decoder → OV")
 
     def _patch_moge(self):
         """Replace the MoGe depth model with OV wrapper."""
@@ -2101,3 +2350,38 @@ def load_test_image(
     if mask.ndim == 3:
         mask = mask[..., -1]
     return image, mask
+
+
+def load_test_masks(
+    folder: Optional[Union[str, Path]] = None,
+    indices: Optional[List[int]] = None,
+    extension: str = ".png",
+):
+    """
+    Load multiple masks from a folder (aligned with ``inference.load_masks``).
+
+    If *indices* is ``None``, discovers all consecutive files ``0.png``, ``1.png``, …
+    Returns list of boolean masks.
+    """
+    from PIL import Image
+
+    if folder is None:
+        folder = _SAM3D_ROOT / "notebook" / "images" / "shutterstock_stylish_kidsroom_1640806567"
+    folder = Path(folder)
+
+    if indices is None:
+        indices = []
+        idx = 0
+        while (folder / f"{idx}{extension}").exists():
+            indices.append(idx)
+            idx += 1
+
+    masks = []
+    for idx in indices:
+        mask_path = folder / f"{idx}{extension}"
+        assert mask_path.exists(), f"Mask {mask_path} does not exist"
+        mask = np.array(Image.open(str(mask_path))).astype(np.uint8) > 0
+        if mask.ndim == 3:
+            mask = mask[..., -1]
+        masks.append(mask)
+    return masks
