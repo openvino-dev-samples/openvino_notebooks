@@ -481,7 +481,7 @@ def patch_cuda_for_cpu():
         }),
         ("kaolin.non_commercial", None),
         ("kaolin.utils", None),
-        ("kaolin.utils.testing", {"check_tensor": _noop}),
+        ("kaolin.utils.testing", {"check_tensor": lambda *a, **kw: True}),
         ("kaolin.visualize", {"IpyTurntableVisualizer": _NoopClass}),
     ]:
         _ensure_mock(mod, attrs)
@@ -742,8 +742,9 @@ def patch_pipeline_config(config):
         config.device = "cpu"
         config.compile_model = False
         config.dtype = "float32"
-        # Keep only Gaussian decoding (mesh needs kaolin / FlexiCubes / CUDA)
-        config.decode_formats = ["gaussian"]
+        # Include both Gaussian and Mesh decoding
+        # Mesh decoder runs on CPU: transformer base in OV, upsample + FlexiCubes in PyTorch
+        config.decode_formats = ["gaussian", "mesh"]
         # Keep rendering engine as pytorch3d (no nvdiffrast)
         config.rendering_engine = "pytorch3d"
     return config
@@ -1320,6 +1321,49 @@ class SLatDecoderForOV(nn.Module):
         return x
 
 
+class SLatMeshDecoderBaseForOV(nn.Module):
+    """
+    Dense-equivalent of ``SparseTransformerBase`` (transformer base only)
+    for the mesh decoder.
+
+    Unlike ``SLatDecoderForOV`` this does **not** include the ``out_layer``.
+    The mesh decoder's out_layer sits *after* the upsample blocks
+    (SparseSubdivide + SparseConv3d) which cannot be converted to OV.
+
+    Input:  feats (N, latent_channels), coords_xyz (N, 3)
+    Output: base_feats (N, model_channels) — after blocks + norm
+    """
+
+    def __init__(self, decoder_base):
+        super().__init__()
+        self.input_layer = decoder_base.input_layer
+        self.pos_embedder = decoder_base.pos_embedder
+        self.blocks = decoder_base.blocks
+        self.pe_mode = decoder_base.pe_mode
+        self.dtype = decoder_base.dtype
+
+    @torch.no_grad()
+    def forward(self, feats, coords_xyz):
+        h = F.linear(feats, self.input_layer.weight, self.input_layer.bias)
+        if self.pe_mode == "ape":
+            h = h + self.pos_embedder(coords_xyz)
+        h = h.type(self.dtype)
+        for block in self.blocks:
+            h = self._sparse_block(block, h)
+        h = F.layer_norm(h, h.shape[-1:])
+        return h
+
+    def _sparse_block(self, block, x):
+        """SparseTransformerBlock — dense feats, full attention."""
+        h = block.norm1(x)
+        h = _dense_sparse_self_attn(block.attn, h)
+        x = x + h
+        h = block.norm2(x)
+        h = _dense_sparse_ffn(block.mlp, h)
+        x = x + h
+        return x
+
+
 class MoGeForOV(nn.Module):
     """
     Wraps the MoGe depth-estimation model for OV conversion.
@@ -1593,6 +1637,39 @@ def convert_slat_decoder(
     return ov_model
 
 
+def convert_slat_decoder_mesh_base(
+    decoder_model,
+    output_path: Union[str, Path],
+    n_voxels: int = 2048,
+    latent_channels: int = 8,
+) -> ov.Model:
+    """
+    Convert the mesh decoder's **transformer base** (without upsample/out_layer)
+    to OpenVINO IR.
+
+    The upsample blocks (SparseSubdivide + SparseConv3d) and FlexiCubes mesh
+    extraction remain in PyTorch.
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
+        return ov.Core().read_model(str(output_path))
+
+    wrapper = SLatMeshDecoderBaseForOV(decoder_model).eval().float()
+    wrapper.dtype = torch.float32
+    example = (
+        torch.randn(n_voxels, latent_channels),
+        torch.randint(0, 64, (n_voxels, 3)),
+    )
+    with torch.no_grad():
+        ov_model = ov.convert_model(wrapper, example_input=example)
+    ov.save_model(ov_model, str(output_path))
+    print(f"[OV-SAM3D] Saved SLat mesh decoder base → {output_path}")
+    del wrapper
+    _cleanup()
+    return ov_model
+
+
 def convert_moge(
     moge_model,
     output_path: Union[str, Path],
@@ -1713,7 +1790,7 @@ def convert_all_models(
     # ── SLat decoders (gaussian, gaussian-4) ──────────────────────────
     slat_decoder_keys = [
         k for k in pipeline.models
-        if k.startswith("slat_decoder_") and k != "slat_decoder_mesh"
+        if k.startswith("slat_decoder_") and k not in ("slat_decoder_mesh",)
     ]
     for dkey in slat_decoder_keys:
         safe_name = dkey.replace("/", "_")
@@ -1723,12 +1800,16 @@ def convert_all_models(
         )
         compiled[f"{safe_name}_ov"] = core.compile_model(ov_m, device)
 
-    # ── SLat mesh decoder — SKIPPED ─────────────────────────────────
-    # The mesh decoder uses SparseSubdivide + SparseConv3d (spconv) for
-    # upsampling and FlexiCubes (CUDA) for mesh extraction.  These are
-    # not convertible to OpenVINO.  Mesh output remains PyTorch-only.
+    # ── SLat mesh decoder (transformer base only) ──────────────────
+    # The upsample blocks (SparseSubdivide + SparseConv3d) and FlexiCubes
+    # mesh extraction remain in PyTorch on CPU.
     if "slat_decoder_mesh" in pipeline.models:
-        print("[OV-SAM3D] Skipping slat_decoder_mesh (requires spconv + FlexiCubes)")
+        print("[OV-SAM3D] Converting slat_decoder_mesh (transformer base) …")
+        ov_m = convert_slat_decoder_mesh_base(
+            pipeline.models["slat_decoder_mesh"],
+            output_dir / "slat_decoder_mesh.xml",
+        )
+        compiled["slat_decoder_mesh_ov"] = core.compile_model(ov_m, device)
 
     # ── MoGe depth model ──────────────────────────────────────────────
     try:
@@ -2266,6 +2347,52 @@ class OVInferencePipelinePointMap:
             orig_key = key[:-3]  # e.g. "slat_decoder_gs"
             if orig_key not in self._pipeline.models:
                 continue
+
+            # ── Mesh decoder: OV for base transformer, PyTorch for rest ──
+            if orig_key == "slat_decoder_mesh":
+                ov_mesh_base = OVSLatDecoder(compiled)
+                decoder = self._pipeline.models[orig_key]
+                orig_upsample = decoder.upsample
+                orig_out_layer = decoder.out_layer
+                orig_to_rep = decoder.to_representation
+                orig_dtype = decoder.dtype
+
+                # Ensure upsample blocks and out_layer use float32 on CPU
+                for block in orig_upsample:
+                    block.float()
+                orig_out_layer.float()
+
+                def _make_ov_mesh_forward(_ov_base, _upsample, _out_layer, _to_rep, _dtype):
+                    def _ov_mesh_forward(x_sparse):
+                        feats = x_sparse.feats
+                        coords = x_sparse.coords
+                        coords_xyz = coords[:, 1:].float()
+                        # Transformer base in OV
+                        base_feats = _ov_base(feats, coords_xyz)
+                        # Rebuild SparseTensor with transformer output
+                        h = x_sparse.replace(base_feats)
+                        # Upsample blocks in PyTorch (SparseSubdivide + SparseConv3d)
+                        for block in _upsample:
+                            h = block(h)
+                        # Ensure float32 for CPU — out_layer weights are float32
+                        h = h.type(torch.float32)
+                        # Out layer in PyTorch (SparseLinear)
+                        h = _out_layer(h)
+                        # FlexiCubes mesh extraction in PyTorch
+                        return _to_rep(h)
+                    return _ov_mesh_forward
+
+                decoder.forward = _make_ov_mesh_forward(
+                    ov_mesh_base, orig_upsample, orig_out_layer, orig_to_rep, orig_dtype,
+                )
+                self._pipeline._ov_slat_decoders = getattr(
+                    self._pipeline, "_ov_slat_decoders", {}
+                )
+                self._pipeline._ov_slat_decoders[orig_key] = ov_mesh_base
+                print(f"[OV-SAM3D] {orig_key} → OV base + PyTorch upsample/FlexiCubes")
+                continue
+
+            # ── GS / GS-4 decoders: full OV replacement ──
             ov_dec = OVSLatDecoder(compiled)
             decoder = self._pipeline.models[orig_key]
             orig_to_rep = decoder.to_representation

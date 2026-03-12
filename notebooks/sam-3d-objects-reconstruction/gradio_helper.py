@@ -2,10 +2,11 @@
 Gradio demo helper for SAM-3D-Objects 3D reconstruction with OpenVINO.
 
 Provides a `make_demo` function that creates a Gradio Blocks interface
-for interactive 3D object reconstruction.
+for interactive 3D object reconstruction with Gaussian Splat and mesh outputs.
 """
 
 import io
+import tempfile
 import warnings
 
 import gradio as gr
@@ -64,6 +65,46 @@ def _render_3d_scatter(gs_output, elev=25, azim=45):
     return np.array(Image.open(buf))
 
 
+def _render_mesh_scatter(glb_mesh, elev=25, azim=45):
+    """Render a trimesh mesh as a matplotlib scatter plot image."""
+    if glb_mesh is None:
+        return None
+
+    verts = glb_mesh.vertices
+    faces = glb_mesh.faces
+
+    # Get vertex colors if available
+    if hasattr(glb_mesh.visual, "vertex_colors") and glb_mesh.visual.vertex_colors is not None:
+        vc = glb_mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
+    else:
+        vc = "steelblue"
+
+    fig = plt.figure(figsize=(10, 8))
+
+    ax1 = fig.add_subplot(121, projection="3d")
+    ax1.scatter(verts[:, 0], verts[:, 1], verts[:, 2], c=vc, s=0.3, alpha=0.4)
+    ax1.set_xlabel("X")
+    ax1.set_ylabel("Y")
+    ax1.set_zlabel("Z")
+    ax1.set_title(f"Mesh ({len(verts):,} verts, {len(faces):,} faces)")
+    ax1.view_init(elev=elev, azim=azim)
+
+    ax2 = fig.add_subplot(122)
+    ax2.scatter(verts[:, 0], verts[:, 2], s=0.2, alpha=0.3,
+                c=vc if isinstance(vc, np.ndarray) else "steelblue")
+    ax2.set_xlabel("X")
+    ax2.set_ylabel("Z")
+    ax2.set_title("Top-down (XZ)")
+    ax2.set_aspect("equal")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return np.array(Image.open(buf))
+
+
 def make_demo(ov_pipeline, image_folder, helper, stage1_steps=2, stage2_steps=2):
     """
     Create a Gradio Blocks demo for SAM-3D-Objects 3D reconstruction.
@@ -112,7 +153,7 @@ def make_demo(ov_pipeline, image_folder, helper, stage1_steps=2, stage2_steps=2)
     def run_reconstruction(mask_idx, s1_steps, s2_steps, progress=gr.Progress()):
         """Run the full 3D reconstruction pipeline."""
         if mask_idx < 0 or mask_idx >= n_masks:
-            return None, "Please select a valid mask index."
+            return None, None, None, "Please select a valid mask index."
 
         mask = all_masks[mask_idx]
         mask_uint8 = mask.astype(np.uint8) * 255
@@ -132,6 +173,7 @@ def make_demo(ov_pipeline, image_folder, helper, stage1_steps=2, stage2_steps=2)
                 with_mesh_postprocess=False,
                 with_texture_baking=False,
                 with_layout_postprocess=False,
+                use_vertex_color=True,
                 stage1_inference_steps=int(s1_steps),
                 stage2_inference_steps=int(s2_steps),
             )
@@ -139,27 +181,42 @@ def make_demo(ov_pipeline, image_folder, helper, stage1_steps=2, stage2_steps=2)
         elapsed = time.time() - t0
         progress(0.9, desc="Rendering 3D visualization …")
 
+        result_img = None
+        mesh_img = None
+        glb_path = None
+        status_parts = []
+
         if "gs" in output and output["gs"] is not None:
             gs = output["gs"]
             n_points = gs._xyz.shape[0]
             result_img = _render_3d_scatter(gs)
-            status = f"Reconstruction complete: {n_points:,} Gaussian points in {elapsed:.1f}s"
-        elif "coords" in output and output["coords"] is not None:
-            coords = output["coords"]
-            status = f"Stage 1 complete: {coords.shape[0]} voxels in {elapsed:.1f}s (Stage 2 may have failed)"
-            result_img = None
+            status_parts.append(f"{n_points:,} Gaussian points")
+
+        if "glb" in output and output["glb"] is not None:
+            glb = output["glb"]
+            n_verts = len(glb.vertices)
+            n_faces = len(glb.faces)
+            mesh_img = _render_mesh_scatter(glb)
+            # Save GLB for download
+            tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+            glb.export(tmp.name)
+            glb_path = tmp.name
+            status_parts.append(f"{n_verts:,} mesh vertices, {n_faces:,} faces")
+
+        if status_parts:
+            status = f"Reconstruction complete in {elapsed:.1f}s: " + " | ".join(status_parts)
         else:
             status = f"Pipeline completed in {elapsed:.1f}s but produced no output."
-            result_img = None
 
-        return result_img, status
+        return result_img, mesh_img, glb_path, status
 
     # Build Gradio UI
     with gr.Blocks(title="SAM-3D-Objects — OpenVINO 3D Reconstruction") as demo:
         gr.Markdown(
             "## SAM-3D-Objects — 3D Object Reconstruction with OpenVINO\n\n"
             "Select a mask index from the demo scene, adjust inference steps, "
-            "then click **Reconstruct 3D** to run the full two-stage pipeline.\n\n"
+            "then click **Reconstruct 3D** to run the full two-stage pipeline.\n"
+            "The pipeline generates both a Gaussian Splat and a vertex-colored mesh (GLB).\n\n"
             "> **Note**: Reconstruction takes ~60-120 seconds depending on hardware."
         )
 
@@ -176,19 +233,22 @@ def make_demo(ov_pipeline, image_folder, helper, stage1_steps=2, stage2_steps=2)
                 s2_slider = gr.Slider(minimum=1, maximum=12, step=1, value=stage2_steps, label="Stage 2 Steps")
                 reconstruct_btn = gr.Button("Reconstruct 3D", variant="primary")
                 status_text = gr.Textbox(label="Status", interactive=False)
+                glb_download = gr.File(label="Download GLB", interactive=False)
 
             with gr.Column(scale=2):
                 with gr.Tab("Input + Mask"):
                     input_preview = gr.Image(label="Image + Mask Overlay", type="numpy", interactive=False)
-                with gr.Tab("3D Reconstruction"):
+                with gr.Tab("3D Gaussian Splat"):
                     output_img = gr.Image(label="3D Gaussian Splat", type="numpy", interactive=False)
+                with gr.Tab("3D Mesh"):
+                    mesh_img = gr.Image(label="Vertex-colored Mesh", type="numpy", interactive=False)
 
         # Event handlers
         mask_slider.change(on_mask_select, inputs=[mask_slider], outputs=[input_preview])
         reconstruct_btn.click(
             run_reconstruction,
             inputs=[mask_slider, s1_slider, s2_slider],
-            outputs=[output_img, status_text],
+            outputs=[output_img, mesh_img, glb_download, status_text],
         )
 
         # Initialize with default mask
