@@ -11,7 +11,8 @@ Converted to OpenVINO IR:
     - Sparse Structure (SS) Decoder — 3D Conv decoder (latent → occupancy grid)
     - PointPatchEmbed inner attention — windowed patch attention for pointmaps
     - SS Generator backbone — 24 MOT transformer blocks + latent mapping projections
-    - SLat Generator core — 24 sparse transformer blocks (dense-equivalent, full attention)
+    - SLat Generator full — t_embedder + input_blocks + 24 core transformer blocks
+      + out_blocks + out_layer (ALL ~600 M weights in one OV model)
     - SLat GS Decoder — 12 sparse transformer blocks (dense, full attention replaces swin)
     - SLat GS-4 Decoder — same architecture as GS, 4 gaussians per voxel
     - SLat Mesh Decoder base — transformer blocks (mesh extraction stays in Python)
@@ -19,8 +20,8 @@ Converted to OpenVINO IR:
     - EmbedderFuser projection nets — per-embedder LayerNorm + FeedForward
 
 Kept in Python (CPU-patched, no learnable weights or thin wrappers):
-    - SLat Generator input/output blocks — SparseResBlock3d (spconv, small weight count)
-    - SLat Decoder to_representation — coordinate-based Gaussian/Mesh construction
+    - SLat Decoder to_representation — coordinate-based Gaussian/Mesh construction (0 weights)
+    - SparseDownsample / SparseUpsample — coordinate-only ops (0 weights)
     - SLat Mesh Decoder upsample + mesh extraction — SparseSubdivide + FlexiCubes
     - Flow matching / shortcut ODE loop — pure control flow
     - Classifier-free guidance wrapper — pure control flow
@@ -1276,6 +1277,228 @@ class SLatGeneratorCoreForOV(nn.Module):
         return x
 
 
+class DenseResBlock(nn.Module):
+    """
+    Dense-equivalent of ``SparseResBlock3d`` for OV export.
+
+    Re-implements the forward path using only standard PyTorch ops:
+    - ``_CenterPixelConv3d``  →  ``nn.Linear`` (center-pixel slice)
+    - ``SparseLinear``        →  ``nn.Linear``
+    - ``LayerNorm32``         → kept as-is (already works on plain tensors)
+    - ``emb_layers`` (SiLU → Linear)  → kept as-is
+
+    SparseDownsample / SparseUpsample are **not** included
+    (they have 0 learnable weights and operate on coordinates only).
+    """
+
+    def __init__(self, sparse_block):
+        super().__init__()
+        self.norm1 = sparse_block.norm1
+        self.norm2 = sparse_block.norm2
+        self.emb_layers = sparse_block.emb_layers
+
+        # Extract center-pixel weights from conv1
+        # SparseConv3d wraps the mocked _CenterPixelConv3d as .conv
+        conv1_inner = self._get_inner_conv(sparse_block.conv1)
+        k = conv1_inner.kernel_size
+        cx, cy, cz = k[0] // 2, k[1] // 2, k[2] // 2
+        cw1 = conv1_inner.weight[:, cx, cy, cz, :].data.clone()
+        self.conv1 = nn.Linear(cw1.shape[1], cw1.shape[0],
+                               bias=conv1_inner.bias is not None)
+        self.conv1.weight.data.copy_(cw1)
+        if conv1_inner.bias is not None:
+            self.conv1.bias.data.copy_(conv1_inner.bias.data)
+
+        # Extract center-pixel weights from conv2
+        conv2_inner = self._get_inner_conv(sparse_block.conv2)
+        k = conv2_inner.kernel_size
+        cx, cy, cz = k[0] // 2, k[1] // 2, k[2] // 2
+        cw2 = conv2_inner.weight[:, cx, cy, cz, :].data.clone()
+        self.conv2 = nn.Linear(cw2.shape[1], cw2.shape[0],
+                               bias=conv2_inner.bias is not None)
+        self.conv2.weight.data.copy_(cw2)
+        if conv2_inner.bias is not None:
+            self.conv2.bias.data.copy_(conv2_inner.bias.data)
+
+        # Skip connection: Identity or SparseLinear (nn.Linear)
+        self.has_skip = not isinstance(sparse_block.skip_connection, nn.Identity)
+        if self.has_skip:
+            sk = sparse_block.skip_connection
+            self.skip = nn.Linear(sk.in_features, sk.out_features,
+                                  bias=sk.bias is not None)
+            self.skip.weight.data.copy_(sk.weight.data)
+            if sk.bias is not None:
+                self.skip.bias.data.copy_(sk.bias.data)
+
+    @staticmethod
+    def _get_inner_conv(conv_module):
+        """Get the inner _CenterPixelConv3d from SparseConv3d wrapper or direct module."""
+        if hasattr(conv_module, 'conv'):
+            return conv_module.conv  # sam3d_objects SparseConv3d wraps as .conv
+        return conv_module  # direct _CenterPixelConv3d
+
+    def forward(self, feats, t_emb):
+        """
+        Parameters
+        ----------
+        feats : (N, C_in) — per-voxel features
+        t_emb : (B, C_t) — timestep embedding
+        """
+        emb_out = self.emb_layers(t_emb)
+        scale, shift = emb_out.chunk(2, dim=-1)
+
+        h = self.norm1(feats)
+        h = F.silu(h)
+        h = self.conv1(h)
+        h = self.norm2(h) * (1 + scale) + shift
+        h = F.silu(h)
+        h = self.conv2(h)
+
+        if self.has_skip:
+            skip = self.skip(feats)
+        else:
+            skip = feats
+        return h + skip
+
+
+class SLatGeneratorFullForOV(nn.Module):
+    """
+    Dense-equivalent of the **full** SLat Generator backbone,
+    including all U-Net components:
+
+    ``t_embedder → input_layer → input_blocks → 24 core transformer blocks
+    → out_blocks → out_layer``
+
+    This replaces ``SLatGeneratorCoreForOV`` and eliminates all remaining
+    PyTorch weight dependencies in the SLat Generator (~46M additional params).
+
+    SparseDownsample / SparseUpsample (0 weights) are removed — in mock mode
+    (centre-pixel ``_CenterPixelConv3d``) they have no effect on features.
+
+    Input:  feats (N, C_in=8), coords_xyz (N, 3), t (B,), cond (1, M, C_cond)
+    Output: feats_out (N, C_in=8)
+    """
+
+    def __init__(self, backbone):
+        super().__init__()
+        self.t_embedder = backbone.t_embedder
+        self.pos_embedder = backbone.pos_embedder
+        self.share_mod = backbone.share_mod
+        self.use_skip_connection = backbone.use_skip_connection
+        self.dtype = backbone.dtype
+
+        # d_embedder (may not exist)
+        self.has_d_embedder = (
+            hasattr(backbone, "d_embedder")
+            and backbone.d_embedder is not None
+        )
+        if self.has_d_embedder:
+            self.d_embedder = backbone.d_embedder
+
+        # adaLN_modulation for share_mod mode
+        if self.share_mod:
+            self.adaLN_modulation = backbone.adaLN_modulation
+
+        # input/output layers (SparseLinear = nn.Linear)
+        il = backbone.input_layer
+        self.input_layer = nn.Linear(
+            il.in_features, il.out_features, bias=il.bias is not None
+        )
+        self.input_layer.weight.data.copy_(il.weight.data)
+        if il.bias is not None:
+            self.input_layer.bias.data.copy_(il.bias.data)
+
+        ol = backbone.out_layer
+        self.out_layer = nn.Linear(
+            ol.in_features, ol.out_features, bias=ol.bias is not None
+        )
+        self.out_layer.weight.data.copy_(ol.weight.data)
+        if ol.bias is not None:
+            self.out_layer.bias.data.copy_(ol.bias.data)
+
+        # Dense-equivalent input/output ResBlocks
+        self.in_res_blocks = nn.ModuleList(
+            [DenseResBlock(b) for b in backbone.input_blocks]
+        )
+        self.out_res_blocks = nn.ModuleList(
+            [DenseResBlock(b) for b in backbone.out_blocks]
+        )
+
+        # 24 core transformer blocks
+        self.core_blocks = backbone.blocks
+
+    @torch.no_grad()
+    def forward(self, feats, coords_xyz, t, cond):
+        """
+        Parameters
+        ----------
+        feats      : (N, 8)  — per-voxel input latent
+        coords_xyz : (N, 3)  — integer voxel coordinates
+        t          : (B,)    — timestep
+        cond       : (1, M, C_cond) — condition tokens
+        """
+        # ── Timestep embedding ──
+        t_emb = self.t_embedder(t)
+        if self.share_mod:
+            t_emb = self.adaLN_modulation(t_emb)
+        t_emb = t_emb.type(feats.dtype)
+        cond = cond.type(feats.dtype)
+
+        # ── Input layer ──
+        h = self.input_layer(feats)
+
+        # ── Input ResBlocks (skip-save) ──
+        skips = []
+        for block in self.in_res_blocks:
+            h = block(h, t_emb)
+            skips.append(h)
+
+        # ── Position embedding + core transformer ──
+        h = h + self.pos_embedder(coords_xyz).type(h.dtype)
+        for block in self.core_blocks:
+            h = self._sparse_cross_block(block, h, t_emb, cond)
+
+        # ── Output ResBlocks (with skip connections) ──
+        for block, skip in zip(self.out_res_blocks, reversed(skips)):
+            if self.use_skip_connection:
+                h = block(torch.cat([h, skip], dim=-1), t_emb)
+            else:
+                h = block(h, t_emb)
+
+        # ── Final norm + output layer ──
+        h = F.layer_norm(h, h.shape[-1:])
+        h = self.out_layer(h)
+        return h
+
+    def _sparse_cross_block(self, block, x, mod, context):
+        """ModulatedSparseTransformerCrossBlock — dense feats, full attention."""
+        if block.share_mod:
+            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = mod.chunk(6, dim=-1)
+        else:
+            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = (
+                block.adaLN_modulation(mod).chunk(6, dim=-1)
+            )
+
+        def _sq(t):
+            return t.squeeze(0) if t.dim() > 1 else t
+
+        # ── self-attention ──
+        h = block.norm1(x) * (1 + _sq(sc_msa)) + _sq(s_msa)
+        h = _dense_sparse_self_attn(block.self_attn, h)
+        x = x + h * _sq(g_msa)
+
+        # ── cross-attention ──
+        h = block.norm2(x)
+        h = _dense_sparse_cross_attn(block.cross_attn, h, context)
+        x = x + h
+
+        # ── FFN ──
+        h = block.norm3(x) * (1 + _sq(sc_mlp)) + _sq(s_mlp)
+        h = _dense_sparse_ffn(block.mlp, h)
+        x = x + h * _sq(g_mlp)
+        return x
+
+
 class SLatDecoderForOV(nn.Module):
     """
     Dense-equivalent of ``SparseTransformerBase`` + output layer for
@@ -1372,6 +1595,115 @@ class SLatMeshDecoderBaseForOV(nn.Module):
         h = _dense_sparse_ffn(block.mlp, h)
         x = x + h
         return x
+
+
+class MeshDecoderUpsampleForOV(nn.Module):
+    """
+    Dense-equivalent of the mesh decoder's **upsample blocks + out_layer**,
+    merged into a single OV-exportable model.
+
+    Replaces:
+    - ``SparseSubdivideBlock3d × 2``  (5.89 M params)
+    - ``SparseLinear`` out_layer       (9 797 params)
+
+    Implementation notes:
+    - ``SparseGroupNorm32`` → ``nn.GroupNorm`` on ``(1, C, N)`` tensors.
+    - ``SparseConv3d``  (center-pixel ``_CenterPixelConv3d``) → ``nn.Linear``.
+    - ``SparseSubdivide`` (0 weights) → ``torch.repeat_interleave(…, 8, dim=0)``.
+    - ``SparseLinear`` → ``nn.Linear``.
+
+    Input:  feats  ``(N, 768)``  — per-voxel features from transformer base
+    Output: out    ``(64N, 101)`` — upsampled & projected features
+    """
+
+    def __init__(self, mesh_decoder):
+        super().__init__()
+
+        up0 = mesh_decoder.upsample[0]
+        up1 = mesh_decoder.upsample[1]
+
+        # ── Upsample block 0:  768 → 192 ──────────────────────────────
+        self.norm0_pre = self._copy_group_norm(up0.act_layers[0])
+        self.conv0_1 = self._center_pixel_to_linear(up0.out_layers[0])
+        self.norm0_post = self._copy_group_norm(up0.out_layers[1])
+        self.conv0_2 = self._center_pixel_to_linear(up0.out_layers[3])
+        self.skip0 = self._center_pixel_to_linear(up0.skip_connection)
+
+        # ── Upsample block 1:  192 → 96 ───────────────────────────────
+        self.norm1_pre = self._copy_group_norm(up1.act_layers[0])
+        self.conv1_1 = self._center_pixel_to_linear(up1.out_layers[0])
+        self.norm1_post = self._copy_group_norm(up1.out_layers[1])
+        self.conv1_2 = self._center_pixel_to_linear(up1.out_layers[3])
+        self.skip1 = self._center_pixel_to_linear(up1.skip_connection)
+
+        # ── Out layer: 96 → 101 ───────────────────────────────────────
+        ol = mesh_decoder.out_layer
+        self.out_layer = nn.Linear(ol.in_features, ol.out_features,
+                                   bias=ol.bias is not None)
+        self.out_layer.weight.data.copy_(ol.weight.data)
+        if ol.bias is not None:
+            self.out_layer.bias.data.copy_(ol.bias.data)
+
+    # ── helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _copy_group_norm(sparse_gn):
+        """Clone weight/bias from ``SparseGroupNorm32`` into plain ``nn.GroupNorm``."""
+        gn = nn.GroupNorm(sparse_gn.num_groups, sparse_gn.num_channels)
+        gn.weight.data.copy_(sparse_gn.weight.data)
+        gn.bias.data.copy_(sparse_gn.bias.data)
+        return gn
+
+    @staticmethod
+    def _center_pixel_to_linear(conv_module):
+        """Extract center-pixel slice from ``_CenterPixelConv3d`` → ``nn.Linear``."""
+        inner = conv_module.conv if hasattr(conv_module, "conv") else conv_module
+        k = inner.kernel_size
+        cx, cy, cz = k[0] // 2, k[1] // 2, k[2] // 2
+        cw = inner.weight[:, cx, cy, cz, :].data.clone()
+        lin = nn.Linear(cw.shape[1], cw.shape[0], bias=inner.bias is not None)
+        lin.weight.data.copy_(cw)
+        if inner.bias is not None:
+            lin.bias.data.copy_(inner.bias.data)
+        return lin
+
+    def _group_norm(self, norm, feats):
+        """``(N, C)`` → ``(1, C, N)`` → GroupNorm → ``(N, C)``."""
+        h = feats.unsqueeze(0).permute(0, 2, 1)
+        h = norm(h)
+        return h.permute(0, 2, 1).squeeze(0)
+
+    def _subdivide_block(self, feats, norm_pre, conv1, norm_post, conv2, skip):
+        """One ``SparseSubdivideBlock3d`` forward with feature expand."""
+        h = F.silu(self._group_norm(norm_pre, feats))
+        # Subdivide feature duplication (8 sub-voxels per voxel)
+        h = torch.repeat_interleave(h, 8, dim=0)
+        x = torch.repeat_interleave(feats, 8, dim=0)
+        h = conv1(h)
+        h = F.silu(self._group_norm(norm_post, h))
+        h = conv2(h)
+        return h + skip(x)
+
+    @torch.no_grad()
+    def forward(self, feats):
+        """
+        Parameters
+        ----------
+        feats : ``(N, 768)``
+
+        Returns
+        -------
+        ``(64N, 101)``
+        """
+        h = self._subdivide_block(
+            feats, self.norm0_pre, self.conv0_1, self.norm0_post,
+            self.conv0_2, self.skip0,
+        )
+        h = self._subdivide_block(
+            h, self.norm1_pre, self.conv1_1, self.norm1_post,
+            self.conv1_2, self.skip1,
+        )
+        return self.out_layer(h)
 
 
 class MoGeForOV(nn.Module):
@@ -1620,6 +1952,45 @@ def convert_slat_generator_core(
     return ov_model
 
 
+def convert_slat_generator_full(
+    slat_gen_model,
+    output_path: Union[str, Path],
+    n_voxels: int = 2048,
+    latent_channels: int = 8,
+    cond_channels: int = 1024,
+    cond_tokens: int = 1370,
+) -> ov.Model:
+    """
+    Convert the **full** SLat Generator backbone (U-Net + core transformer)
+    to a single OpenVINO IR.
+
+    This replaces ``convert_slat_generator_core`` and additionally includes
+    ``t_embedder``, ``input_layer``, ``input_blocks`` (SparseResBlock3d),
+    ``out_blocks``, and ``out_layer`` — eliminating ~46 M PyTorch weight
+    parameters.
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
+        return ov.Core().read_model(str(output_path))
+
+    wrapper = SLatGeneratorFullForOV(slat_gen_model).eval().float()
+    wrapper.dtype = torch.float32   # override fp16 dtype after .float()
+    example = (
+        torch.randn(n_voxels, latent_channels),                 # feats
+        torch.randint(0, 32, (n_voxels, 3)),                    # coords_xyz
+        torch.zeros(1),                                          # t
+        torch.randn(1, cond_tokens, cond_channels),             # cond
+    )
+    with torch.no_grad():
+        ov_model = ov.convert_model(wrapper, example_input=example)
+    ov.save_model(ov_model, str(output_path))
+    print(f"[OV-SAM3D] Saved SLat generator full → {output_path}")
+    del wrapper
+    _cleanup()
+    return ov_model
+
+
 def convert_slat_decoder(
     decoder_model,
     output_path: Union[str, Path],
@@ -1675,6 +2046,37 @@ def convert_slat_decoder_mesh_base(
         ov_model = ov.convert_model(wrapper, example_input=example)
     ov.save_model(ov_model, str(output_path))
     print(f"[OV-SAM3D] Saved SLat mesh decoder base → {output_path}")
+    del wrapper
+    _cleanup()
+    return ov_model
+
+
+def convert_mesh_decoder_upsample(
+    decoder_model,
+    output_path: Union[str, Path],
+    n_voxels: int = 2048,
+    model_channels: int = 768,
+) -> ov.Model:
+    """
+    Convert the mesh decoder's **upsample blocks + out_layer** to OV IR.
+
+    Merges ``SparseSubdivideBlock3d × 2`` (5.89 M params) and the
+    ``SparseLinear`` out_layer (9 797 params) into a single OV model.
+
+    Input:  ``(N, 768)`` — transformer base output features
+    Output: ``(64N, 101)`` — upsampled & projected features
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
+        return ov.Core().read_model(str(output_path))
+
+    wrapper = MeshDecoderUpsampleForOV(decoder_model).eval().float()
+    example = torch.randn(n_voxels, model_channels)
+    with torch.no_grad():
+        ov_model = ov.convert_model(wrapper, example_input=example)
+    ov.save_model(ov_model, str(output_path))
+    print(f"[OV-SAM3D] Saved mesh decoder upsample+out_layer → {output_path}")
     del wrapper
     _cleanup()
     return ov_model
@@ -1789,13 +2191,13 @@ def convert_all_models(
     ov_m = convert_ss_generator(ss_gen_backbone, output_dir / "ss_generator.xml")
     compiled["ss_generator_ov"] = core.compile_model(ov_m, device)
 
-    # ── SLat generator core transformer ────────────────────────────────
-    print("[OV-SAM3D] Converting SLat generator core …")
+    # ── SLat generator full (U-Net + core transformer in one model) ──
+    print("[OV-SAM3D] Converting SLat generator full backbone …")
     slat_gen = pipeline.models["slat_generator"]
     # Unwrap FlowMatching / ClassifierFreeGuidance → backbone
     slat_gen_backbone = _unwrap_to_backbone(slat_gen)
-    ov_m = convert_slat_generator_core(slat_gen_backbone, output_dir / "slat_generator_core.xml")
-    compiled["slat_generator_core_ov"] = core.compile_model(ov_m, device)
+    ov_m = convert_slat_generator_full(slat_gen_backbone, output_dir / "slat_generator_full.xml")
+    compiled["slat_generator_full_ov"] = core.compile_model(ov_m, device)
 
     # ── SLat decoders (gaussian, gaussian-4) ──────────────────────────
     slat_decoder_keys = [
@@ -1811,8 +2213,6 @@ def convert_all_models(
         compiled[f"{safe_name}_ov"] = core.compile_model(ov_m, device)
 
     # ── SLat mesh decoder (transformer base only) ──────────────────
-    # The upsample blocks (SparseSubdivide + SparseConv3d) and FlexiCubes
-    # mesh extraction remain in PyTorch on CPU.
     if "slat_decoder_mesh" in pipeline.models:
         print("[OV-SAM3D] Converting slat_decoder_mesh (transformer base) …")
         ov_m = convert_slat_decoder_mesh_base(
@@ -1820,6 +2220,17 @@ def convert_all_models(
             output_dir / "slat_decoder_mesh.xml",
         )
         compiled["slat_decoder_mesh_ov"] = core.compile_model(ov_m, device)
+
+    # ── Mesh decoder upsample blocks + out_layer ──────────────────
+    # All weighted ops (SparseGroupNorm, SparseConv3d, SparseLinear)
+    # merged into one OV model.  FlexiCubes (0 weights) stays in Python.
+    if "slat_decoder_mesh" in pipeline.models:
+        print("[OV-SAM3D] Converting mesh decoder upsample + out_layer …")
+        ov_m = convert_mesh_decoder_upsample(
+            pipeline.models["slat_decoder_mesh"],
+            output_dir / "mesh_decoder_upsample.xml",
+        )
+        compiled["mesh_decoder_upsample_ov"] = core.compile_model(ov_m, device)
 
     # ── MoGe depth model ──────────────────────────────────────────────
     try:
@@ -1981,6 +2392,36 @@ class OVSLatGeneratorCore:
         return torch.from_numpy(out_np.copy())
 
 
+class OVSLatGeneratorFull:
+    """
+    Replaces the **full** SLat generator backbone with a single OV model.
+
+    ``(feats, coords_xyz, t, cond) → out_feats``
+
+    The OV model includes t_embedder, input_layer, input_blocks (dense ResBlocks),
+    24 core transformer blocks, output_blocks, and out_layer — all weights in OV.
+    """
+
+    def __init__(self, compiled_model: ov.CompiledModel):
+        self.compiled_model = compiled_model
+        self._infer_request = compiled_model.create_infer_request()
+
+    def __call__(
+        self,
+        feats: torch.Tensor,
+        coords_xyz: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        feats_np = feats.float().detach().cpu().numpy()
+        coords_np = coords_xyz.float().detach().cpu().numpy()
+        t_np = t.float().detach().cpu().numpy()
+        cond_np = cond.float().detach().cpu().numpy()
+        self._infer_request.infer([feats_np, coords_np, t_np, cond_np])
+        out_np = self._infer_request.get_output_tensor(0).data
+        return torch.from_numpy(out_np.copy())
+
+
 class OVSLatDecoder:
     """
     Replaces the SLat decoder's transformer base with an OV model.
@@ -2000,6 +2441,27 @@ class OVSLatDecoder:
         feats_np = feats.float().detach().cpu().numpy()
         coords_np = coords_xyz.float().detach().cpu().numpy()
         self._infer_request.infer([feats_np, coords_np])
+        out_np = self._infer_request.get_output_tensor(0).data
+        return torch.from_numpy(out_np.copy())
+
+
+class OVMeshDecoderUpsample:
+    """
+    OV wrapper for the merged mesh-decoder upsample blocks + out_layer.
+
+    ``(feats) → out_feats``
+
+    Input:  ``(N, 768)``
+    Output: ``(64N, 101)``
+    """
+
+    def __init__(self, compiled_model: ov.CompiledModel):
+        self.compiled_model = compiled_model
+        self._infer_request = compiled_model.create_infer_request()
+
+    def __call__(self, feats: torch.Tensor) -> torch.Tensor:
+        feats_np = feats.float().detach().cpu().numpy()
+        self._infer_request.infer(feats_np)
         out_np = self._infer_request.get_output_tensor(0).data
         return torch.from_numpy(out_np.copy())
 
@@ -2259,31 +2721,74 @@ class OVInferencePipelinePointMap:
         print("[OV-SAM3D] SS generator backbone → OV")
 
     def _patch_slat_generator(self):
-        """Replace the SLat generator core transformer blocks with OV model.
+        """Replace the SLat generator backbone with OV model.
 
-        The SLat backbone is a U-Net:
-            input_layer → input_blocks (SparseResBlock3d) → 24 core blocks → out_blocks → out_layer
+        **Full OV mode** (``slat_generator_full_ov``):
+            The entire backbone (t_embedder + input_layer + input_blocks +
+            24 core transformer blocks + out_blocks + out_layer) runs in a
+            single OV model.  ALL ~600 M weights are in OV — zero PyTorch
+            weight dependencies.
 
-        The input/output blocks use spconv (approximated by our centre-pixel
-        mock) and stay in PyTorch.  Only the 24 core
-        ``ModulatedSparseTransformerCrossBlock`` modules are replaced by a
-        single OV model.
+        **Legacy core-only mode** (``slat_generator_core_ov``):
+            Only the 24 core transformer blocks run in OV; the U-Net
+            input/output blocks (~46 M params) stay in PyTorch.
         """
+        # ── Prefer full mode ──
+        if "slat_generator_full_ov" in self._compiled:
+            ov_full = OVSLatGeneratorFull(self._compiled["slat_generator_full_ov"])
+            backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
+
+            orig_cond_emb = backbone.condition_embedder
+            force_zeros = backbone.force_zeros_cond
+
+            def _ov_forward_full(x, t, *cond_args, **cond_kwargs):
+                d = cond_kwargs.pop("d", None)
+                if not torch.compiler.is_compiling():
+                    if "coords" in cond_kwargs:
+                        coords_raw = cond_kwargs.pop("coords")
+                    else:
+                        coords_raw = cond_args[-1]
+                        cond_args = cond_args[:-1]
+                else:
+                    coords_raw = cond_args[-1]
+                    cond_args = cond_args[:-1]
+                cfg_activate = cond_kwargs.pop("cfg", False)
+                coords = (
+                    torch.tensor(coords_raw).to(x.device)
+                    if not isinstance(coords_raw, torch.Tensor)
+                    else coords_raw
+                )
+
+                # Condition embedding
+                if force_zeros and cfg_activate:
+                    cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
+                else:
+                    cond = orig_cond_emb(*cond_args, **cond_kwargs)
+
+                # Full backbone → single OV call
+                feats = x[0]                         # (N, C_in)
+                coords_xyz = coords[:, 1:].float()   # (N, 3) — strip batch dim
+                out_feats = ov_full(feats, coords_xyz, t, cond)
+                return out_feats[None]                # (1, N, C_in)
+
+            backbone.forward = _ov_forward_full
+            self._pipeline._ov_slat_generator_full = ov_full
+            print("[OV-SAM3D] SLat generator backbone → OV (full, all weights in OV)")
+            return
+
+        # ── Fallback: core-only mode ──
         if "slat_generator_core_ov" not in self._compiled:
             return
         ov_core = OVSLatGeneratorCore(self._compiled["slat_generator_core_ov"])
         backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
 
-        # References to backbone components
         orig_cond_emb = backbone.condition_embedder
         force_zeros = backbone.force_zeros_cond
         bb_dtype = backbone.dtype
 
-        # Import the project's SparseTensor for constructing internal tensors
         from sam3d_objects.model.backbone.tdfy_dit.modules.sparse import SparseTensor as SPT
 
         def _ov_forward(x, t, *cond_args, **cond_kwargs):
-            # ── Parse args exactly like SLatFlowModelTdfyWrapper.forward ──
             d = cond_kwargs.pop("d", None)
             if not torch.compiler.is_compiling():
                 if "coords" in cond_kwargs:
@@ -2297,16 +2802,12 @@ class OVInferencePipelinePointMap:
             cfg_activate = cond_kwargs.pop("cfg", False)
             coords = torch.tensor(coords_raw).to(x.device) if not isinstance(coords_raw, torch.Tensor) else coords_raw
 
-            # ── Condition embedding ──
             if force_zeros and cfg_activate:
                 cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
             else:
                 cond = orig_cond_emb(*cond_args, **cond_kwargs)
 
-            # ── Create SparseTensor (mirrors SLatFlowModelTdfyWrapper) ──
             x_sparse = SPT(feats=x[0], coords=coords)
-
-            # ── SLatFlowModel.forward path ──
             h = backbone.input_layer(x_sparse).type(bb_dtype)
 
             t_emb = backbone.t_embedder(t)
@@ -2317,13 +2818,11 @@ class OVInferencePipelinePointMap:
             t_emb = t_emb.type(bb_dtype)
             cond = cond.type(bb_dtype)
 
-            # ── Input blocks (PyTorch, centre-pixel spconv) ──
             skips = []
             for block in backbone.input_blocks:
                 h = block(h, t_emb)
                 skips.append(h.feats)
 
-            # ── Core transformer blocks → OV ──
             h_feats = h.feats
             if backbone.pe_mode == "ape":
                 h_feats = h_feats + backbone.pos_embedder(h.coords[:, 1:]).type(bb_dtype)
@@ -2333,21 +2832,19 @@ class OVInferencePipelinePointMap:
             )
             h = h.replace(h_feats_out.type(bb_dtype))
 
-            # ── Output blocks (PyTorch, centre-pixel spconv) ──
             for block, skip in zip(backbone.out_blocks, reversed(skips)):
                 if backbone.use_skip_connection:
                     h = block(h.replace(torch.cat([h.feats, skip], dim=1)), t_emb)
                 else:
                     h = block(h, t_emb)
 
-            # ── Final norm + output layer ──
             h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
             h = backbone.out_layer(h.type(x_sparse.dtype))
             return h.feats[None]
 
         backbone.forward = _ov_forward
         self._pipeline._ov_slat_generator_core = ov_core
-        print("[OV-SAM3D] SLat generator backbone → OV")
+        print("[OV-SAM3D] SLat generator backbone → OV (core only)")
 
     def _patch_slat_decoders(self):
         """Replace SLat decoder transformer blocks with OV models."""
@@ -2358,48 +2855,91 @@ class OVInferencePipelinePointMap:
             if orig_key not in self._pipeline.models:
                 continue
 
-            # ── Mesh decoder: OV for base transformer, PyTorch for rest ──
+            # ── Mesh decoder: OV for base transformer + upsample ──
             if orig_key == "slat_decoder_mesh":
                 ov_mesh_base = OVSLatDecoder(compiled)
                 decoder = self._pipeline.models[orig_key]
+                orig_to_rep = decoder.to_representation
+
+                # Check if OV upsample model is available
+                has_ov_upsample = "mesh_decoder_upsample_ov" in self._compiled
+                if has_ov_upsample:
+                    ov_upsample = OVMeshDecoderUpsample(
+                        self._compiled["mesh_decoder_upsample_ov"]
+                    )
+                else:
+                    ov_upsample = None
+
                 orig_upsample = decoder.upsample
                 orig_out_layer = decoder.out_layer
-                orig_to_rep = decoder.to_representation
-                orig_dtype = decoder.dtype
 
-                # Ensure upsample blocks and out_layer use float32 on CPU
+                # Ensure PyTorch fallback uses float32
                 for block in orig_upsample:
                     block.float()
                 orig_out_layer.float()
 
-                def _make_ov_mesh_forward(_ov_base, _upsample, _out_layer, _to_rep, _dtype):
+                def _make_ov_mesh_forward(
+                    _ov_base, _ov_up, _upsample, _out_layer, _to_rep,
+                ):
+                    def _subdivide_coords(coords):
+                        """Replicate coordinates for one SparseSubdivide step (0 weights)."""
+                        offsets = torch.zeros(8, coords.shape[-1], dtype=coords.dtype)
+                        # 8 sub-voxel offsets: (0,0,0)..(1,1,1) for the spatial dims
+                        for idx in range(8):
+                            offsets[idx, 1] = idx // 4
+                            offsets[idx, 2] = (idx // 2) % 2
+                            offsets[idx, 3] = idx % 2
+                        new_c = coords.clone()
+                        new_c[:, 1:] *= 2
+                        new_c = new_c.unsqueeze(1) + offsets.unsqueeze(0)
+                        return new_c.reshape(-1, coords.shape[-1])
+
                     def _ov_mesh_forward(x_sparse):
                         feats = x_sparse.feats
                         coords = x_sparse.coords
                         coords_xyz = coords[:, 1:].float()
-                        # Transformer base in OV
+                        # ── Transformer base in OV ──
                         base_feats = _ov_base(feats, coords_xyz)
-                        # Rebuild SparseTensor with transformer output
-                        h = x_sparse.replace(base_feats)
-                        # Upsample blocks in PyTorch (SparseSubdivide + SparseConv3d)
-                        for block in _upsample:
-                            h = block(h)
-                        # Ensure float32 for CPU — out_layer weights are float32
-                        h = h.type(torch.float32)
-                        # Out layer in PyTorch (SparseLinear)
-                        h = _out_layer(h)
-                        # FlexiCubes mesh extraction in PyTorch
+
+                        if _ov_up is not None:
+                            # ── Upsample + out_layer fully in OV ──
+                            out_feats = _ov_up(base_feats)
+                            # Compute subdivided coords (2 stages, 0 weights)
+                            new_coords = coords
+                            for _ in range(2):
+                                new_coords = _subdivide_coords(new_coords)
+                            # Rebuild SparseTensor for FlexiCubes
+                            from sam3d_objects.model.backbone.tdfy_dit.modules.sparse.basic import SparseTensor as SPT
+                            h = SPT(
+                                out_feats.float(),
+                                new_coords.to(coords.dtype),
+                            )
+                            h._scale = x_sparse._scale * 4
+                            h._spatial_cache = x_sparse._spatial_cache
+                        else:
+                            # ── Fallback: OV base + PyTorch upsample ──
+                            h = x_sparse.replace(base_feats)
+                            for block in _upsample:
+                                h = block(h)
+                            h = h.type(torch.float32)
+                            h = _out_layer(h)
+
                         return _to_rep(h)
                     return _ov_mesh_forward
 
                 decoder.forward = _make_ov_mesh_forward(
-                    ov_mesh_base, orig_upsample, orig_out_layer, orig_to_rep, orig_dtype,
+                    ov_mesh_base, ov_upsample, orig_upsample,
+                    orig_out_layer, orig_to_rep,
                 )
                 self._pipeline._ov_slat_decoders = getattr(
                     self._pipeline, "_ov_slat_decoders", {}
                 )
                 self._pipeline._ov_slat_decoders[orig_key] = ov_mesh_base
-                print(f"[OV-SAM3D] {orig_key} → OV base + PyTorch upsample/FlexiCubes")
+                if has_ov_upsample:
+                    self._pipeline._ov_slat_decoders["mesh_upsample"] = ov_upsample
+                    print(f"[OV-SAM3D] {orig_key} → OV base + OV upsample + FlexiCubes")
+                else:
+                    print(f"[OV-SAM3D] {orig_key} → OV base + PyTorch upsample/FlexiCubes")
                 continue
 
             # ── GS / GS-4 decoders: full OV replacement ──
@@ -2609,10 +3149,12 @@ def load_compiled_models(
         # Other models
         "ss_decoder_ov": "ss_decoder.xml",
         "ss_generator_ov": "ss_generator.xml",
+        "slat_generator_full_ov": "slat_generator_full.xml",
         "slat_generator_core_ov": "slat_generator_core.xml",
         "slat_decoder_gs_ov": "slat_decoder_gs.xml",
         "slat_decoder_gs_4_ov": "slat_decoder_gs_4.xml",
         "slat_decoder_mesh_ov": "slat_decoder_mesh.xml",
+        "mesh_decoder_upsample_ov": "mesh_decoder_upsample.xml",
         "moge_ov": "moge.xml",
     }
 
