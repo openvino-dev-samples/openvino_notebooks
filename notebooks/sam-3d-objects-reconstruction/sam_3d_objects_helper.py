@@ -299,14 +299,14 @@ def patch_cuda_for_cpu():
                     setattr(self, k, v)
 
         def __getattr__(self, name):
-            if name.startswith("_"):
+            if name.startswith("__") and name.endswith("__"):
                 raise AttributeError(name)
             # Check if a child mock module exists in sys.modules
             child = f"{self.__name__}.{name}"
             if child in sys.modules:
                 return sys.modules[child]
-            # Return a noop class for any missing attribute (handles unknown imports)
-            return _NoopClass
+            # Return a noop callable for any missing attribute (handles unknown imports)
+            return _noop
 
     def _ensure_mock(mod_name: str, attrs: dict = None):
         """Insert a lightweight stub module if the real one is not available."""
@@ -333,6 +333,7 @@ def patch_cuda_for_cpu():
     _pt3d_structures_attrs = {
         "Meshes": _NoopClass,
         "Pointclouds": _NoopClass,
+        "join_meshes_as_scene": _noop,
     }
     _pt3d_renderer_attrs = {
         "PerspectiveCameras": _NoopClass,
@@ -362,7 +363,16 @@ def patch_cuda_for_cpu():
         ("pytorch3d.loss", None),
         ("pytorch3d.ops", None),
         ("pytorch3d.vis", None),
-        ("pytorch3d.vis.plotly_vis", None),
+        ("pytorch3d.vis.plotly_vis", {
+            "AxisArgs": type("AxisArgs", (), {"__init__": lambda self, **kw: None, "_asdict": lambda self: {}}),
+            "Lighting": _NoopClass,
+            "_add_camera_trace": _noop,
+            "_add_pointcloud_trace": _noop,
+            "_add_ray_bundle_trace": _noop,
+            "_is_ray_bundle": _noop,
+            "_scale_camera_to_bounds": _noop,
+            "_update_axes_bounds": _noop,
+        }),
         ("pytorch3d.viz", None),
         ("pytorch3d.viz.plotly_vis", None),
     ]:
@@ -486,12 +496,12 @@ def patch_cuda_for_cpu():
     ]:
         _ensure_mock(mod, attrs)
 
-    # Patch utils3d.numpy to have depth_edge if missing
-    try:
-        from utils3d.numpy import depth_edge  # noqa: F401
-    except ImportError:
-        import utils3d.numpy as _u3d_np
-        _u3d_np.depth_edge = _noop
+    # Patch utils3d.numpy to have missing functions
+    import utils3d.numpy as _u3d_np
+    for _fn_name in ("depth_edge", "normals_edge", "points_to_normals",
+                     "image_uv", "image_mesh"):
+        if not hasattr(_u3d_np, _fn_name):
+            setattr(_u3d_np, _fn_name, _noop)
 
     # moge — depth estimation model ——————————————————————————————————
     class _MockMoGeModel(nn.Module):
@@ -2470,6 +2480,35 @@ class OVInferencePipelinePointMap:
     # ------------------------------------------------------------------
     #  Public API — mirrors the original pipeline
     # ------------------------------------------------------------------
+
+    def __call__(
+        self,
+        image: Union[np.ndarray, "PIL.Image.Image"],
+        mask: Optional[Union[None, np.ndarray]] = None,
+        seed: Optional[int] = None,
+        pointmap=None,
+    ) -> dict:
+        """
+        Callable interface aligned with ``inference.Inference.__call__``.
+
+        Merges *image* and *mask* into an RGBA array and delegates to
+        ``pipeline.run()`` — exactly what the original
+        ``demo_single_object.ipynb`` does via ``inference(image, mask, seed=42)``.
+        """
+        mask_uint8 = mask.astype(np.uint8) * 255
+        rgba_image = np.concatenate([image[..., :3], mask_uint8[..., None]], axis=-1)
+        return self._pipeline.run(
+            image=rgba_image,
+            mask=None,
+            seed=seed,
+            pointmap=pointmap,
+            stage1_only=False,
+            with_mesh_postprocess=False,
+            with_texture_baking=False,
+            with_layout_postprocess=False,
+            use_vertex_color=True,
+        )
+
     def run(
         self,
         image: Union[np.ndarray, "PIL.Image.Image"],
@@ -2485,7 +2524,7 @@ class OVInferencePipelinePointMap:
         stage2_inference_steps: Optional[int] = None,
         decode_formats: Optional[List[str]] = None,
     ) -> dict:
-        """Run the full 3D reconstruction pipeline."""
+        """Run the full 3D reconstruction pipeline (advanced interface)."""
         return self._pipeline.run(
             image=image,
             mask=mask,
