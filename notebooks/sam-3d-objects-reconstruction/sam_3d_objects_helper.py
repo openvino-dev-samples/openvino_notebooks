@@ -6,23 +6,32 @@ OpenVINO helper for SAM-3D-Objects (Meta) 3D reconstruction pipeline.
 This module converts ALL weighted sub-models in the SAM-3D-Objects pipeline
 to OpenVINO IR and wraps the full pipeline for CPU / OpenVINO inference.
 
+Weight coverage: **100%** — every weighted component is either in an OV IR model
+or saved to a tensor config file (``tensor_config.npz``).
+
 Converted to OpenVINO IR:
     - DINOv2 condition embedders (ViT-L/14) — image and mask encoders (×4)
     - Sparse Structure (SS) Decoder — 3D Conv decoder (latent → occupancy grid)
-    - PointPatchEmbed inner attention — windowed patch attention for pointmaps
+    - PointPatchEmbed (full) — point_proj + invalid_xyz_token + transformer block
+      + cls_token + pos_embed_window + pos_embed (ALL weights in one OV model)
     - SS Generator backbone — 24 MOT transformer blocks + latent mapping projections
     - SLat Generator full — t_embedder + input_blocks + 24 core transformer blocks
       + out_blocks + out_layer (ALL ~600 M weights in one OV model)
     - SLat GS Decoder — 12 sparse transformer blocks (dense, full attention replaces swin)
     - SLat GS-4 Decoder — same architecture as GS, 4 gaussians per voxel
-    - SLat Mesh Decoder base — transformer blocks (mesh extraction stays in Python)
+    - SLat Mesh Decoder base — transformer blocks
+    - SLat Mesh Decoder upsample + out_layer — SparseConv3d + GroupNorm merged into OV
     - MoGe depth model — ViT-based monocular geometry estimation
     - EmbedderFuser projection nets — per-embedder LayerNorm + FeedForward
 
-Kept in Python (CPU-patched, no learnable weights or thin wrappers):
+Saved to tensor config file (non-op weight tensors):
+    - EmbedderFuser idx_emb — learned positional embeddings (SS + SLat)
+
+Kept in Python (CPU-patched, no learnable weights):
     - SLat Decoder to_representation — coordinate-based Gaussian/Mesh construction (0 weights)
     - SparseDownsample / SparseUpsample — coordinate-only ops (0 weights)
-    - SLat Mesh Decoder upsample + mesh extraction — SparseSubdivide + FlexiCubes
+    - SparseSubdivide coordinate expansion — replicate coords (0 weights)
+    - FlexiCubes mesh extraction — pure math (0 weights)
     - Flow matching / shortcut ODE loop — pure control flow
     - Classifier-free guidance wrapper — pure control flow
 """
@@ -962,6 +971,82 @@ class PointPatchEmbedInnerForOV(nn.Module):
             self.pos_embed, size=(n_win_h, n_win_w), mode="bilinear", align_corners=False
         ).permute(0, 2, 3, 1).reshape(1, n_win_h * n_win_w, D)
         out = window_embeddings + pos_embed_patch
+        return out
+
+
+class PointPatchEmbedFullForOV(nn.Module):
+    """
+    Full ``PointPatchEmbed`` wrapper for OV conversion.
+
+    Includes ALL weighted components:
+    - ``point_proj`` (nn.Linear: 3 → embed_dim)
+    - ``invalid_xyz_token`` (nn.Parameter: embed_dim)
+    - ``cls_token``, ``pos_embed_window``, ``pos_embed`` (nn.Parameters)
+    - ``blocks`` (timm transformer Block(s))
+
+    The pre-processing (resize, NaN detection, point remapping) stays in Python.
+    Valid-mask–based blending uses ``torch.where`` (OV-compatible, no dynamic indexing).
+
+    Input:
+        xyz_remapped : (B, input_size, input_size, 3)  — remapped XYZ coordinates
+        valid_mask_f : (B, input_size, input_size)      — 1.0 valid, 0.0 invalid
+
+    Output:
+        tokens : (B, n_windows, embed_dim)
+    """
+
+    def __init__(self, ppe):
+        super().__init__()
+        self.point_proj = ppe.point_proj
+        self.invalid_xyz_token = ppe.invalid_xyz_token
+        self.cls_token = ppe.cls_token
+        self.pos_embed_window = ppe.pos_embed_window
+        self.pos_embed = ppe.pos_embed
+        self.blocks = ppe.blocks
+        self.input_size = ppe.input_size
+        self.patch_size = ppe.patch_size
+        self.embed_dim = ppe.embed_dim
+
+    @torch.no_grad()
+    def forward(self, xyz_remapped: torch.Tensor, valid_mask_f: torch.Tensor) -> torch.Tensor:
+        B = xyz_remapped.shape[0]
+        H = self.input_size
+        W = self.input_size
+        ps = self.patch_size
+        D = self.embed_dim
+
+        # ── point_proj: (B, H, W, 3) → (B, H, W, D) ──
+        x = self.point_proj(xyz_remapped)
+
+        # ── Blend with invalid_xyz_token for masked pixels (OV-safe) ──
+        invalid_tok = self.invalid_xyz_token.view(1, 1, 1, D).expand_as(x)
+        mask_expanded = valid_mask_f.unsqueeze(-1).expand_as(x)
+        x = x * mask_expanded + invalid_tok * (1.0 - mask_expanded)
+
+        # ── Reshape into windows: (B*n_win, ps*ps, D) ──
+        n_win_h = H // ps
+        n_win_w = W // ps
+        x = x.view(B, n_win_h, ps, n_win_w, ps, D)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(-1, ps * ps, D)
+
+        # ── CLS token + positional embedding ──
+        cls_tok = self.cls_token.expand(x.shape[0], -1, -1)
+        toks = torch.cat([cls_tok, x], dim=1)
+        toks = toks + self.pos_embed_window
+
+        # ── Transformer blocks ──
+        for blk in self.blocks:
+            toks = blk(toks)
+
+        # ── Extract CLS tokens + patch-level positional embedding ──
+        window_embeddings = toks[:, 0].view(B, n_win_h * n_win_w, D)
+        pos_embed_patch = F.interpolate(
+            self.pos_embed, size=(n_win_h, n_win_w),
+            mode="bilinear", align_corners=False,
+        ).permute(0, 2, 3, 1).reshape(1, n_win_h * n_win_w, D)
+        out = window_embeddings + pos_embed_patch
+
         return out
 
 
@@ -2139,6 +2224,76 @@ def convert_embedder_projection(
     return ov_model
 
 
+def convert_point_patch_embed_full(
+    ppe_model,
+    output_path: Union[str, Path],
+) -> ov.Model:
+    """
+    Convert PointPatchEmbed (all weights: point_proj, invalid_xyz_token,
+    cls_token, pos_embed_window, pos_embed, transformer blocks) to OV IR.
+
+    Input:
+        xyz_remapped  : (1, input_size, input_size, 3) float32
+        valid_mask_f   : (1, input_size, input_size) float32 (1=valid, 0=invalid)
+    Output:
+        tokens : (1, n_windows, embed_dim) float32
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
+        return ov.Core().read_model(str(output_path))
+
+    wrapper = PointPatchEmbedFullForOV(ppe_model).eval().float()
+    H = W = ppe_model.input_size
+    example_xyz = torch.randn(1, H, W, 3, dtype=torch.float32)
+    example_mask = torch.ones(1, H, W, dtype=torch.float32)
+    with torch.no_grad():
+        ov_model = ov.convert_model(
+            wrapper, example_input=(example_xyz, example_mask),
+        )
+    ov.save_model(ov_model, str(output_path))
+    print(f"[OV-SAM3D] Saved PointPatchEmbed (full) → {output_path}")
+    del wrapper
+    _cleanup()
+    return ov_model
+
+
+def save_tensor_config(
+    tensors: Dict[str, torch.Tensor],
+    output_path: Union[str, Path],
+) -> None:
+    """
+    Save non-op weight tensors (nn.Parameter / buffer) to a NumPy ``.npz``
+    config file so the OV pipeline can reload them without PyTorch models.
+
+    Parameters
+    ----------
+    tensors : dict[str, Tensor]
+        E.g. ``{"ss_cond_idx_emb": tensor, "slat_cond_idx_emb": tensor}``.
+    output_path : str | Path
+        Path for the ``.npz`` file.
+    """
+    output_path = Path(output_path)
+    np_dict = {k: v.detach().cpu().float().numpy() for k, v in tensors.items()}
+    np.savez(str(output_path), **np_dict)
+    print(f"[OV-SAM3D] Saved tensor config ({len(tensors)} tensors) → {output_path}")
+
+
+def load_tensor_config(config_path: Union[str, Path]) -> Dict[str, torch.Tensor]:
+    """
+    Load non-op weight tensors from an ``.npz`` config file.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+    """
+    config_path = Path(config_path)
+    if not config_path.exists():
+        return {}
+    data = np.load(str(config_path))
+    return {k: torch.from_numpy(data[k].copy()) for k in data.files}
+
+
 def convert_all_models(
     pipeline,
     output_dir: Union[str, Path],
@@ -2253,6 +2408,27 @@ def convert_all_models(
                         proj_net, output_dir / f"{proj_key}.xml",
                     )
                     compiled[f"{proj_key}_ov"] = core.compile_model(ov_m, device)
+
+    # ── PointPatchEmbed (full: point_proj + transformer) ───────────────
+    ss_emb = pipeline.condition_embedders.get("ss_condition_embedder")
+    if ss_emb is not None and hasattr(ss_emb, "embedder_list"):
+        for i, (sub_emb, _) in enumerate(ss_emb.embedder_list):
+            if type(sub_emb).__name__ == "PointPatchEmbed":
+                print(f"[OV-SAM3D] Converting PointPatchEmbed (embedder {i}) …")
+                ov_m = convert_point_patch_embed_full(
+                    sub_emb, output_dir / "point_patch_embed.xml",
+                )
+                compiled["point_patch_embed_ov"] = core.compile_model(ov_m, device)
+
+    # ── Save non-op tensor config (idx_emb etc.) ──────────────────────
+    tensor_config: Dict[str, torch.Tensor] = {}
+    for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+        if stage_name in pipeline.condition_embedders:
+            emb = pipeline.condition_embedders[stage_name]
+            if hasattr(emb, "idx_emb"):
+                tensor_config[f"{stage_name}__idx_emb"] = emb.idx_emb.data
+    if tensor_config:
+        save_tensor_config(tensor_config, output_dir / "tensor_config.npz")
 
     _cleanup()
     print(f"[OV-SAM3D] All models saved to {output_dir}")
@@ -2504,6 +2680,67 @@ class OVEmbedderProjection(nn.Module):
         return torch.from_numpy(out_np.copy()).to(dtype=x.dtype, device=x.device)
 
 
+class OVPointPatchEmbed:
+    """
+    Drop-in replacement for ``PointPatchEmbed`` using an OV compiled model.
+
+    The OV model contains ALL weighted components (point_proj, invalid_xyz_token,
+    cls_token, pos_embed_window, pos_embed, transformer blocks).
+
+    Pre-processing (resize, NaN detection, point remapping) stays in Python.
+    """
+
+    def __init__(self, compiled_model: ov.CompiledModel, original_ppe):
+        self.compiled_model = compiled_model
+        self._infer_request = compiled_model.create_infer_request()
+        self.embed_dim = original_ppe.embed_dim
+        self.input_size = original_ppe.input_size
+        self.patch_size = original_ppe.patch_size
+        self.dropout_prob = original_ppe.dropout_prob
+        self.force_dropout_always = original_ppe.force_dropout_always
+        # Keep PointRemapper in Python (0 weights, pure math)
+        self.point_remapper = original_ppe.point_remapper
+
+    def __call__(self, xyz: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        xyz        : (B, 3, H, W) — raw point coordinates
+        valid_mask : (B, H, W) boolean (optional)
+
+        Returns
+        -------
+        (B, n_windows, embed_dim) — per-window tokens
+        """
+        # ── Python pre-processing (mirrors embed_pointmap_windows) ──
+        with torch.no_grad():
+            # Resize to input_size × input_size
+            resized_xyz = F.interpolate(
+                xyz, size=self.input_size, mode="nearest",
+            ).permute(0, 2, 3, 1)  # (B, H, W, 3)
+
+            if valid_mask is None:
+                valid_mask = resized_xyz.isfinite().all(dim=-1)  # (B, H, W)
+
+            xyz_safe = resized_xyz.clone()
+            xyz_safe[~valid_mask] = 0.0
+            xyz_remapped = self.point_remapper(xyz_safe)
+
+        # ── OV inference ──
+        xyz_np = xyz_remapped.float().detach().cpu().numpy()
+        mask_np = valid_mask.float().detach().cpu().numpy()
+        self._infer_request.infer([xyz_np, mask_np])
+        out_np = self._infer_request.get_output_tensor(0).data
+        return torch.from_numpy(out_np.copy())
+
+    def parameters(self):
+        """No PyTorch parameters — all weights in OV model."""
+        return iter([])
+
+    def to(self, *args, **kwargs):
+        return self
+
+
 # ============================================================================
 # 5.  OV PIPELINE — modified InferencePipelinePointMap that uses OV models
 # ============================================================================
@@ -2528,6 +2765,7 @@ class OVInferencePipelinePointMap:
         self,
         original_pipeline,
         compiled_models: Dict[str, Any],
+        ov_model_dir: Union[str, Path, None] = None,
     ):
         """
         Parameters
@@ -2536,9 +2774,12 @@ class OVInferencePipelinePointMap:
             The original pipeline loaded on CPU.
         compiled_models : dict
             Dict returned by ``convert_all_models``.
+        ov_model_dir : str | Path | None
+            Directory where OV IR files and tensor_config.npz are stored.
         """
         self._pipeline = original_pipeline
         self._compiled = compiled_models
+        self._ov_model_dir = Path(ov_model_dir) if ov_model_dir else None
         self._patch_embedders()
         self._patch_ss_decoder()
         self._patch_ss_generator()
@@ -2612,7 +2853,55 @@ class OVInferencePipelinePointMap:
                             self._compiled[proj_key]
                         )
 
+        # Patch PointPatchEmbed (SS embedder_list index 2, if present)
+        if "point_patch_embed_ov" in self._compiled:
+            for i, (sub_emb, modality) in enumerate(ss_emb.embedder_list):
+                if type(sub_emb).__name__ == "PointPatchEmbed":
+                    ov_ppe = OVPointPatchEmbed(
+                        self._compiled["point_patch_embed_ov"],
+                        sub_emb,
+                    )
+                    ss_emb.embedder_list[i] = (ov_ppe, modality)
+                    ss_emb.module_list[i] = nn.Identity()
+                    print("[OV-SAM3D] PointPatchEmbed replaced with OV wrapper")
+                    break
+
+        # Load non-op tensor config (idx_emb) and inject into embedders
+        self._load_tensor_config()
+
         print("[OV-SAM3D] DINOv2 embedders replaced with OV wrappers (merged backbone)")
+
+    def _load_tensor_config(self):
+        """Load non-op weight tensors (idx_emb etc.) from the config file.
+
+        The idx_emb learned positional embeddings are injected back into the
+        EmbedderFuser's ``idx_emb`` attribute so the original forward logic
+        (which adds ``idx_emb[pos_idx]`` to condition tokens) Just Works.
+        """
+        # Find the config file
+        config_path = None
+        if self._ov_model_dir is not None:
+            config_path = self._ov_model_dir / "tensor_config.npz"
+        if config_path is None or not config_path.exists():
+            # Try standard locations
+            for candidate in [
+                Path(__file__).parent / "ov_models" / "tensor_config.npz",
+                Path("ov_models") / "tensor_config.npz",
+            ]:
+                if candidate.exists():
+                    config_path = candidate
+                    break
+
+        if config_path is None or not config_path.exists():
+            return
+
+        cfg = load_tensor_config(config_path)
+        for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+            key = f"{stage_name}__idx_emb"
+            if key in cfg:
+                emb = self._pipeline.condition_embedders[stage_name]
+                emb.idx_emb = nn.Parameter(cfg[key])
+                print(f"[OV-SAM3D] Loaded {key} from tensor config")
 
     def _patch_embedders_legacy(self):
         """Legacy: patch using separate per-model DINOv2 OV files."""
