@@ -297,6 +297,22 @@ def patch_cuda_for_cpu():
         "__call__": _noop,
     })
 
+    # Minimal Pointclouds mock for make_scene() / SceneVisualizer
+    class _CPUPointclouds:
+        """Minimal stand-in for ``pytorch3d.structures.Pointclouds``."""
+        def __init__(self, points=None, features=None, **kwargs):
+            if points is not None:
+                self._points = [p for p in points] if isinstance(points, (list, tuple)) else [points]
+            else:
+                self._points = []
+            self._features = features
+
+        def points_list(self):
+            return self._points
+
+        def __len__(self):
+            return len(self._points)
+
     class _MockModule(_types.ModuleType):
         """A mock module that returns _noop for any missing attribute."""
         def __init__(self, name, attrs=None):
@@ -342,7 +358,7 @@ def patch_cuda_for_cpu():
     }
     _pt3d_structures_attrs = {
         "Meshes": _NoopClass,
-        "Pointclouds": _NoopClass,
+        "Pointclouds": _CPUPointclouds,
         "join_meshes_as_scene": _noop,
     }
     _pt3d_renderer_attrs = {
@@ -649,22 +665,23 @@ def patch_cuda_for_cpu():
     except Exception:
         pass
 
-    # 6. Patch compute_pointmap to bypass mocked pytorch3d transforms & MoGe
-    #    The real compute_pointmap uses Transform3d & look_at_view_transform from
-    #    pytorch3d (mocked → _NoopClass/None) and MoGe (mocked → empty dict).
-    #    We replace it with a CPU-safe version that generates synthetic pointmap
-    #    data so the rest of the pipeline (OV-important parts) can run.
+    # 6. Patch compute_pointmap to use OV MoGe when available, with proper
+    #    camera coordinate transform using our CPU pytorch3d replacements.
+    #    Falls back to synthetic pointmap only when no OV MoGe is available.
     try:
         from sam3d_objects.pipeline.inference_pipeline_pointmap import InferencePipelinePointMap as _IPPM
+        from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
 
         _orig_compute_pm = _IPPM.compute_pointmap
 
         def _compute_pointmap_cpu(self, image, pointmap=None):
             loaded_image = self.image_to_float(image)
             loaded_image = torch.from_numpy(loaded_image)
+            loaded_mask = loaded_image[..., -1] if loaded_image.shape[-1] == 4 else torch.ones(loaded_image.shape[:2])
             loaded_image = loaded_image.permute(2, 0, 1).contiguous()[:3]  # (3, H, W)
             _, H, W = loaded_image.shape
 
+            intrinsics = None
             if pointmap is not None:
                 points_tensor = pointmap.to(self.device)
                 if loaded_image.shape != points_tensor.shape:
@@ -672,30 +689,68 @@ def patch_cuda_for_cpu():
                         points_tensor.permute(2, 0, 1).unsqueeze(0),
                         size=(H, W), mode="nearest",
                     ).squeeze(0).permute(1, 2, 0)
-                points_tensor = points_tensor.permute(2, 0, 1)  # (3, H, W)
+            elif hasattr(self, '_ov_moge') and self._ov_moge is not None:
+                # ── Use OV MoGe depth model for real pointmap prediction ──
+                with torch.no_grad():
+                    moge_output = self._ov_moge(loaded_image.unsqueeze(0))
+                    if isinstance(moge_output, dict):
+                        pointmaps = moge_output.get("pointmaps", moge_output.get("points", moge_output))
+                    elif isinstance(moge_output, torch.Tensor):
+                        pointmaps = moge_output
+                    else:
+                        pointmaps = torch.from_numpy(np.array(moge_output))
+                    # Ensure shape (H, W, 3)
+                    if pointmaps.dim() == 4:
+                        pointmaps = pointmaps.squeeze(0)
+                    if pointmaps.shape[-1] != 3 and pointmaps.shape[0] == 3:
+                        pointmaps = pointmaps.permute(1, 2, 0)
+                    # Apply camera convention transform (R3 → pytorch3d)
+                    R, T = _cpu_look_at_view_transform(
+                        eye=[[0, 0, -1]], at=[[0, 0, 0]], up=[[0, -1, 0]],
+                    )
+                    cam_transform = CPUTransform3d().rotate(R.squeeze(0))
+                    points_tensor = cam_transform.transform_points(pointmaps)
+                    intrinsics = None  # will be inferred below
             else:
-                # Generate synthetic depth-based pointmap (bypass MoGe + pytorch3d)
-                # Create a grid of (x, y) coordinates normalized to [-0.5, 0.5]
+                # ── Fallback: synthetic pointmap when MoGe is not available ──
                 ys = torch.linspace(-0.5, 0.5, H)
                 xs = torch.linspace(-0.5, 0.5, W)
                 yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-                # Synthetic depth: slightly curved surface
                 zz = torch.ones(H, W) * 2.0 + 0.1 * (xx ** 2 + yy ** 2)
-                points_tensor = torch.stack([xx, yy, zz], dim=0)  # (3, H, W)
+                points_tensor = torch.stack([xx, yy, zz], dim=-1)  # (H, W, 3)
+
+            # Infer intrinsics if not provided
+            if intrinsics is None:
+                try:
+                    pts_for_intrinsics = points_tensor
+                    if pts_for_intrinsics.dim() == 3 and pts_for_intrinsics.shape[0] == 3:
+                        pts_for_intrinsics = pts_for_intrinsics.permute(1, 2, 0)
+                    # Inverse camera transform for intrinsics inference
+                    R_inv, _ = _cpu_look_at_view_transform(
+                        eye=[[0, 0, -1]], at=[[0, 0, 0]], up=[[0, -1, 0]],
+                    )
+                    cam_inv = CPUTransform3d().rotate(R_inv.squeeze(0)).inverse()
+                    pts_moge = cam_inv.transform_points(pts_for_intrinsics)
+                    intrinsics_result = infer_intrinsics_from_pointmap(
+                        pts_moge, device="cpu",
+                    )
+                    intrinsics = intrinsics_result["intrinsics"]
+                except Exception:
+                    # Fallback intrinsics
+                    focal = float(max(H, W))
+                    intrinsics = torch.tensor([
+                        [focal, 0.0,   W / 2.0],
+                        [0.0,   focal, H / 2.0],
+                        [0.0,   0.0,   1.0],
+                    ], dtype=torch.float32)
+
+            # Ensure points_tensor is (3, H, W) for clip_pointmap
+            if points_tensor.dim() == 3 and points_tensor.shape[-1] == 3:
+                points_tensor = points_tensor.permute(2, 0, 1)
 
             # Clip pointmap if configured
-            if hasattr(self, '_clip_pointmap') and hasattr(self, 'clip_pointmap_beyond_scale'):
-                loaded_mask = self.image_to_float(image)
-                loaded_mask = torch.from_numpy(loaded_mask)[..., -1] if loaded_mask.shape[-1] == 4 else torch.ones(H, W)
+            if hasattr(self, '_clip_pointmap'):
                 points_tensor = self._clip_pointmap(points_tensor, loaded_mask)
-
-            # Build default intrinsics (pinhole camera, focal length = image width)
-            focal = float(max(H, W))
-            intrinsics = torch.tensor([
-                [focal, 0.0,   W / 2.0],
-                [0.0,   focal, H / 2.0],
-                [0.0,   0.0,   1.0],
-            ], dtype=torch.float32)
 
             return {
                 "pts_color": loaded_image,
@@ -1294,74 +1349,6 @@ class SSGeneratorForOV(nn.Module):
         return attn.to_out["shape"](out_s), attn.to_out[pk](out_p)
 
 
-class SLatGeneratorCoreForOV(nn.Module):
-    """
-    Dense-equivalent of the SLat Generator's main transformer loop.
-
-    Converts 24 ``ModulatedSparseTransformerCrossBlock`` (full-attention mode)
-    to operate on flat (N, C) feature tensors without SparseTensor.
-
-    **Not included** (kept in Python wrapper):
-      * input/output ``SparseResBlock3d`` (spconv-dependent)
-      * SparseTensor construction / coordinate management
-
-    Input:  feats (N, C_model), coords_xyz (N, 3),
-            t_emb (1, 6*C) if share_mod else (1, C),
-            cond (1, M, C_cond)
-    Output: feats_out (N, C_model)
-    """
-
-    def __init__(self, slat_gen):
-        super().__init__()
-        self.pos_embedder = slat_gen.pos_embedder
-        self.blocks = slat_gen.blocks        # 24 ModulatedSparseTransformerCrossBlock
-        self.share_mod = slat_gen.share_mod
-        self.dtype = slat_gen.dtype
-
-    @torch.no_grad()
-    def forward(self, feats, coords_xyz, t_emb, cond):
-        """
-        Parameters
-        ----------
-        feats : (N, C_model) — post input-block features
-        coords_xyz : (N, 3) — integer voxel coordinates
-        t_emb : (1, 6*C_model) if share_mod else (1, C_model) — timestep embedding
-        cond : (1, M, C_cond) — condition tokens
-        """
-        h = feats + self.pos_embedder(coords_xyz).type(feats.dtype)
-
-        for block in self.blocks:
-            h = self._sparse_cross_block(block, h, t_emb, cond)
-        return h
-
-    def _sparse_cross_block(self, block, x, mod, context):
-        """ModulatedSparseTransformerCrossBlock — dense feats, full attention."""
-        if block.share_mod:
-            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = mod.chunk(6, dim=-1)
-        else:
-            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = block.adaLN_modulation(mod).chunk(6, dim=-1)
-
-        # Squeeze batch dim for broadcast (mod is (1, 6C) or (6C,))
-        def _sq(t):
-            return t.squeeze(0) if t.dim() > 1 else t
-
-        # ── self-attention ──
-        h = block.norm1(x) * (1 + _sq(sc_msa)) + _sq(s_msa)
-        h = _dense_sparse_self_attn(block.self_attn, h)
-        x = x + h * _sq(g_msa)
-
-        # ── cross-attention ──
-        h = block.norm2(x)
-        h = _dense_sparse_cross_attn(block.cross_attn, h, context)
-        x = x + h
-
-        # ── FFN ──
-        h = block.norm3(x) * (1 + _sq(sc_mlp)) + _sq(s_mlp)
-        h = _dense_sparse_ffn(block.mlp, h)
-        x = x + h * _sq(g_mlp)
-        return x
-
-
 class DenseResBlock(nn.Module):
     """
     Dense-equivalent of ``SparseResBlock3d`` for OV export.
@@ -1460,7 +1447,7 @@ class SLatGeneratorFullForOV(nn.Module):
     SparseDownsample / SparseUpsample (0 weights) are removed — in mock mode
     (centre-pixel ``_CenterPixelConv3d``) they have no effect on features.
 
-    Input:  feats (N, C_in=8), coords_xyz (N, 3), t (B,), cond (1, M, C_cond)
+    Input:  feats (N, C_in=8), coords_xyz (N, 3), t (B,), d (B,), cond (1, M, C_cond)
     Output: feats_out (N, C_in=8)
     """
 
@@ -1513,17 +1500,20 @@ class SLatGeneratorFullForOV(nn.Module):
         self.core_blocks = backbone.blocks
 
     @torch.no_grad()
-    def forward(self, feats, coords_xyz, t, cond):
+    def forward(self, feats, coords_xyz, t, d, cond):
         """
         Parameters
         ----------
         feats      : (N, 8)  — per-voxel input latent
         coords_xyz : (N, 3)  — integer voxel coordinates
         t          : (B,)    — timestep
+        d          : (B,)    — shortcut distillation step
         cond       : (1, M, C_cond) — condition tokens
         """
         # ── Timestep embedding ──
         t_emb = self.t_embedder(t)
+        if self.has_d_embedder:
+            t_emb = t_emb + self.d_embedder(d)
         if self.share_mod:
             t_emb = self.adaLN_modulation(t_emb)
         t_emb = t_emb.type(feats.dtype)
@@ -2005,38 +1995,6 @@ def convert_ss_generator(
     return ov_model
 
 
-def convert_slat_generator_core(
-    slat_gen_model,
-    output_path: Union[str, Path],
-    n_voxels: int = 2048,
-    model_channels: int = 1024,
-    cond_channels: int = 1024,
-    cond_tokens: int = 1370,
-) -> ov.Model:
-    """Convert the SLat Generator core transformer blocks to OpenVINO IR."""
-    output_path = Path(output_path)
-    if output_path.exists():
-        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
-        return ov.Core().read_model(str(output_path))
-
-    wrapper = SLatGeneratorCoreForOV(slat_gen_model).eval().float()
-    wrapper.dtype = torch.float32   # override fp16 dtype after .float()
-    t_emb_dim = 6 * model_channels if wrapper.share_mod else model_channels
-    example = (
-        torch.randn(n_voxels, model_channels),                  # feats
-        torch.randint(0, 32, (n_voxels, 3)),                    # coords_xyz
-        torch.randn(1, t_emb_dim),                              # t_emb
-        torch.randn(1, cond_tokens, cond_channels),             # cond
-    )
-    with torch.no_grad():
-        ov_model = ov.convert_model(wrapper, example_input=example)
-    ov.save_model(ov_model, str(output_path))
-    print(f"[OV-SAM3D] Saved SLat generator core → {output_path}")
-    del wrapper
-    _cleanup()
-    return ov_model
-
-
 def convert_slat_generator_full(
     slat_gen_model,
     output_path: Union[str, Path],
@@ -2049,7 +2007,7 @@ def convert_slat_generator_full(
     Convert the **full** SLat Generator backbone (U-Net + core transformer)
     to a single OpenVINO IR.
 
-    This replaces ``convert_slat_generator_core`` and additionally includes
+    This includes
     ``t_embedder``, ``input_layer``, ``input_blocks`` (SparseResBlock3d),
     ``out_blocks``, and ``out_layer`` — eliminating ~46 M PyTorch weight
     parameters.
@@ -2065,6 +2023,7 @@ def convert_slat_generator_full(
         torch.randn(n_voxels, latent_channels),                 # feats
         torch.randint(0, 32, (n_voxels, 3)),                    # coords_xyz
         torch.zeros(1),                                          # t
+        torch.zeros(1),                                          # d (distillation step)
         torch.randn(1, cond_tokens, cond_channels),             # cond
     )
     with torch.no_grad():
@@ -2323,6 +2282,12 @@ def convert_all_models(
     core = ov.Core()
     compiled = {}
 
+    def _compile_and_free(ov_m, key):
+        """Compile OV model, store it, and free the un-compiled IR."""
+        compiled[key] = core.compile_model(ov_m, device)
+        del ov_m
+        _cleanup()
+
     # ── Merged DINOv2 backbone (shared across all 4 embedders) ─────────
     # All four DINOv2 embedders (SS-image, SS-mask, SLat-image, SLat-mask)
     # share identical ViT-L/14 weights.  Convert once → ~3.6 GB savings.
@@ -2330,13 +2295,21 @@ def convert_all_models(
     ss_dino_image = ss_embedder.embedder_list[0][0]   # any of the 4 will do
     print("[OV-SAM3D] Converting merged DINOv2 backbone (1 model for all 4 embedders) …")
     ov_m = convert_dino_backbone(ss_dino_image, output_dir / "dino_backbone.xml")
-    compiled["dino_backbone_ov"] = core.compile_model(ov_m, device)
+    _compile_and_free(ov_m, "dino_backbone_ov")
+    # Release original DINOv2 backbone weights from all embedders
+    for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+        emb = pipeline.condition_embedders[stage_name]
+        for sub_emb, _ in emb.embedder_list:
+            if hasattr(sub_emb, "backbone"):
+                sub_emb.backbone = None
+    _cleanup()
+    print("[OV-SAM3D]   Freed original DINOv2 backbone weights")
 
     # ── SS decoder ─────────────────────────────────────────────────────
     print("[OV-SAM3D] Converting SS decoder …")
     ss_decoder = pipeline.models["ss_decoder"]
     ov_m = convert_ss_decoder(ss_decoder, output_dir / "ss_decoder.xml")
-    compiled["ss_decoder_ov"] = core.compile_model(ov_m, device)
+    _compile_and_free(ov_m, "ss_decoder_ov")
 
     # ── SS generator backbone ──────────────────────────────────────────
     print("[OV-SAM3D] Converting SS generator backbone …")
@@ -2344,7 +2317,7 @@ def convert_all_models(
     # Unwrap ShortCut / ClassifierFreeGuidance → backbone
     ss_gen_backbone = _unwrap_to_backbone(ss_gen)
     ov_m = convert_ss_generator(ss_gen_backbone, output_dir / "ss_generator.xml")
-    compiled["ss_generator_ov"] = core.compile_model(ov_m, device)
+    _compile_and_free(ov_m, "ss_generator_ov")
 
     # ── SLat generator full (U-Net + core transformer in one model) ──
     print("[OV-SAM3D] Converting SLat generator full backbone …")
@@ -2352,7 +2325,7 @@ def convert_all_models(
     # Unwrap FlowMatching / ClassifierFreeGuidance → backbone
     slat_gen_backbone = _unwrap_to_backbone(slat_gen)
     ov_m = convert_slat_generator_full(slat_gen_backbone, output_dir / "slat_generator_full.xml")
-    compiled["slat_generator_full_ov"] = core.compile_model(ov_m, device)
+    _compile_and_free(ov_m, "slat_generator_full_ov")
 
     # ── SLat decoders (gaussian, gaussian-4) ──────────────────────────
     slat_decoder_keys = [
@@ -2365,7 +2338,7 @@ def convert_all_models(
         ov_m = convert_slat_decoder(
             pipeline.models[dkey], output_dir / f"{safe_name}.xml",
         )
-        compiled[f"{safe_name}_ov"] = core.compile_model(ov_m, device)
+        _compile_and_free(ov_m, f"{safe_name}_ov")
 
     # ── SLat mesh decoder (transformer base only) ──────────────────
     if "slat_decoder_mesh" in pipeline.models:
@@ -2374,7 +2347,7 @@ def convert_all_models(
             pipeline.models["slat_decoder_mesh"],
             output_dir / "slat_decoder_mesh.xml",
         )
-        compiled["slat_decoder_mesh_ov"] = core.compile_model(ov_m, device)
+        _compile_and_free(ov_m, "slat_decoder_mesh_ov")
 
     # ── Mesh decoder upsample blocks + out_layer ──────────────────
     # All weighted ops (SparseGroupNorm, SparseConv3d, SparseLinear)
@@ -2385,14 +2358,14 @@ def convert_all_models(
             pipeline.models["slat_decoder_mesh"],
             output_dir / "mesh_decoder_upsample.xml",
         )
-        compiled["mesh_decoder_upsample_ov"] = core.compile_model(ov_m, device)
+        _compile_and_free(ov_m, "mesh_decoder_upsample_ov")
 
     # ── MoGe depth model ──────────────────────────────────────────────
     try:
         if hasattr(pipeline, "depth_model") and pipeline.depth_model is not None:
             print("[OV-SAM3D] Converting MoGe depth model …")
             ov_m = convert_moge(pipeline.depth_model, output_dir / "moge.xml")
-            compiled["moge_ov"] = core.compile_model(ov_m, device)
+            _compile_and_free(ov_m, "moge_ov")
     except Exception as e:
         print(f"[OV-SAM3D] Warning: MoGe conversion failed ({e}), skipping")
 
@@ -2439,6 +2412,43 @@ def convert_all_models(
 # 4.  OV INFERENCE WRAPPERS — drop-in replacements that call compiled OV models
 # ============================================================================
 
+class _DINOv2InferenceCache:
+    """
+    Shared cache for DINOv2 backbone inference results.
+
+    The merged DINOv2 backbone produces two outputs (postnorm + prenorm) in a
+    single forward pass.  When the SS stage (prenorm=False) runs with an input,
+    we cache both outputs keyed by a hash of the input tensor.  When the SLat
+    stage (prenorm=True) runs with the *same* input, we return the cached result
+    instead of re-running inference.
+
+    This reduces DINOv2 inference from 4 calls to 2 (image once, mask once).
+    """
+
+    def __init__(self):
+        self._cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self._max_entries = 4  # only need image + mask
+
+    def _hash_input(self, x_np: np.ndarray) -> int:
+        # Use a fast hash: shape + data hash of a strided view
+        return hash((x_np.shape, x_np.data.tobytes()[:4096]))
+
+    def get(self, x_np: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        h = self._hash_input(x_np)
+        return self._cache.get(h)
+
+    def put(self, x_np: np.ndarray, out0: np.ndarray, out1: np.ndarray):
+        h = self._hash_input(x_np)
+        self._cache[h] = (out0, out1)
+        # Evict old entries if cache grows too large
+        if len(self._cache) > self._max_entries:
+            oldest = next(iter(self._cache))
+            del self._cache[oldest]
+
+    def clear(self):
+        self._cache.clear()
+
+
 class OVDinoEmbedder:
     """
     Replaces a ``Dino`` nn.Module with an OpenVINO compiled-model wrapper.
@@ -2449,8 +2459,21 @@ class OVDinoEmbedder:
 
     For mask inputs, repeats 1-channel → 3-channel before calling the model.
 
+    Uses a shared ``_DINOv2InferenceCache`` to avoid redundant inference:
+    SS and SLat stages share the same input image/mask, so the first call
+    caches both outputs and the second call returns from cache.
+
+    **P3 optimization**: When ``projection_compiled`` is provided, applies the
+    EmbedderFuser projection net (LayerNorm → FeedForward) directly on the
+    numpy backbone output, eliminating a separate numpy↔torch round-trip.
+    The caller should set ``projection_nets[i] = nn.Identity()`` in the
+    EmbedderFuser so the projection is not applied twice.
+
     Preserves the same ``__call__(x) → tokens`` API expected by ``EmbedderFuser``.
     """
+
+    # Class-level shared cache (shared across all OVDinoEmbedder instances)
+    _shared_cache = _DINOv2InferenceCache()
 
     def __init__(
         self,
@@ -2458,6 +2481,7 @@ class OVDinoEmbedder:
         embed_dim: int,
         is_mask: bool = False,
         prenorm: bool = False,
+        projection_compiled: ov.CompiledModel = None,
     ):
         self.compiled_model = compiled_model
         self.embed_dim = embed_dim
@@ -2465,6 +2489,10 @@ class OVDinoEmbedder:
         self.prenorm = prenorm  # True → SLat stage (output 1), False → SS stage (output 0)
         self._output_index = 1 if prenorm else 0
         self._infer_request = compiled_model.create_infer_request()
+        # P3: inline projection — runs on numpy directly, no torch round-trip
+        self._proj_infer_request = None
+        if projection_compiled is not None:
+            self._proj_infer_request = projection_compiled.create_infer_request()
 
     def __call__(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         orig_dtype = x.dtype
@@ -2474,9 +2502,30 @@ class OVDinoEmbedder:
         if self.is_mask and x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
         x_np = x.float().detach().cpu().numpy()
-        self._infer_request.infer(x_np)
-        out_np = self._infer_request.get_output_tensor(self._output_index).data
+
+        # ── Try cache first ──
+        cached = self._shared_cache.get(x_np)
+        if cached is not None:
+            out_np = cached[self._output_index]
+        else:
+            # ── Run inference and cache both outputs ──
+            self._infer_request.infer(x_np)
+            out0 = self._infer_request.get_output_tensor(0).data.copy()
+            out1 = self._infer_request.get_output_tensor(1).data.copy()
+            self._shared_cache.put(x_np, out0, out1)
+            out_np = out0 if self._output_index == 0 else out1
+
+        # ── P3: Apply projection inline on numpy (skip torch round-trip) ──
+        if self._proj_infer_request is not None:
+            self._proj_infer_request.infer(out_np)
+            out_np = self._proj_infer_request.get_output_tensor(0).data.copy()
+
         return torch.from_numpy(out_np.copy()).to(dtype=orig_dtype, device=orig_device)
+
+    @classmethod
+    def clear_cache(cls):
+        """Clear the shared inference cache (call between pipeline runs)."""
+        cls._shared_cache.clear()
 
     def eval(self):
         return self
@@ -2541,41 +2590,15 @@ class OVSSGenerator:
         return tuple(outputs)
 
 
-class OVSLatGeneratorCore:
-    """
-    Replaces the SLat generator's core transformer blocks with an OV model.
-
-    ``(feats, coords_xyz, t_emb, cond) → out_feats``
-    """
-
-    def __init__(self, compiled_model: ov.CompiledModel):
-        self.compiled_model = compiled_model
-        self._infer_request = compiled_model.create_infer_request()
-
-    def __call__(
-        self,
-        feats: torch.Tensor,
-        coords_xyz: torch.Tensor,
-        t_emb: torch.Tensor,
-        cond: torch.Tensor,
-    ) -> torch.Tensor:
-        feats_np = feats.float().detach().cpu().numpy()
-        coords_np = coords_xyz.float().detach().cpu().numpy()
-        t_emb_np = t_emb.float().detach().cpu().numpy()
-        cond_np = cond.float().detach().cpu().numpy()
-        self._infer_request.infer([feats_np, coords_np, t_emb_np, cond_np])
-        out_np = self._infer_request.get_output_tensor(0).data
-        return torch.from_numpy(out_np.copy())
-
-
 class OVSLatGeneratorFull:
     """
     Replaces the **full** SLat generator backbone with a single OV model.
 
-    ``(feats, coords_xyz, t, cond) → out_feats``
+    ``(feats, coords_xyz, t, d, cond) → out_feats``
 
-    The OV model includes t_embedder, input_layer, input_blocks (dense ResBlocks),
-    24 core transformer blocks, output_blocks, and out_layer — all weights in OV.
+    The OV model includes t_embedder, d_embedder, input_layer, input_blocks
+    (dense ResBlocks), 24 core transformer blocks, output_blocks, and
+    out_layer — all weights in OV.
     """
 
     def __init__(self, compiled_model: ov.CompiledModel):
@@ -2587,13 +2610,15 @@ class OVSLatGeneratorFull:
         feats: torch.Tensor,
         coords_xyz: torch.Tensor,
         t: torch.Tensor,
+        d: torch.Tensor,
         cond: torch.Tensor,
     ) -> torch.Tensor:
         feats_np = feats.float().detach().cpu().numpy()
         coords_np = coords_xyz.float().detach().cpu().numpy()
         t_np = t.float().detach().cpu().numpy()
+        d_np = d.float().detach().cpu().numpy()
         cond_np = cond.float().detach().cpu().numpy()
-        self._infer_request.infer([feats_np, coords_np, t_np, cond_np])
+        self._infer_request.infer([feats_np, coords_np, t_np, d_np, cond_np])
         out_np = self._infer_request.get_output_tensor(0).data
         return torch.from_numpy(out_np.copy())
 
@@ -2806,12 +2831,18 @@ class OVInferencePipelinePointMap:
 
         backbone_compiled = self._compiled["dino_backbone_ov"]
 
+        # Helper: look up projection compiled model for a given stage + index
+        def _get_proj(stage_name, idx):
+            proj_key = f"{stage_name}_proj_{idx}_ov"
+            return self._compiled.get(proj_key)
+
         # SS condition embedder (prenorm=False → output index 0)
         ss_emb = self._pipeline.condition_embedders["ss_condition_embedder"]
         img_dino = ss_emb.embedder_list[0][0]
         ss_emb.embedder_list[0] = (
             OVDinoEmbedder(backbone_compiled, img_dino.embed_dim,
-                           is_mask=False, prenorm=False),
+                           is_mask=False, prenorm=False,
+                           projection_compiled=_get_proj("ss_condition_embedder", 0)),
             ss_emb.embedder_list[0][1],
         )
         ss_emb.module_list[0] = nn.Identity()
@@ -2819,7 +2850,8 @@ class OVInferencePipelinePointMap:
         mask_dino = ss_emb.embedder_list[1][0]
         ss_emb.embedder_list[1] = (
             OVDinoEmbedder(backbone_compiled, mask_dino.embed_dim,
-                           is_mask=True, prenorm=False),
+                           is_mask=True, prenorm=False,
+                           projection_compiled=_get_proj("ss_condition_embedder", 1)),
             ss_emb.embedder_list[1][1],
         )
         ss_emb.module_list[1] = nn.Identity()
@@ -2829,7 +2861,8 @@ class OVInferencePipelinePointMap:
         img_dino = slat_emb.embedder_list[0][0]
         slat_emb.embedder_list[0] = (
             OVDinoEmbedder(backbone_compiled, img_dino.embed_dim,
-                           is_mask=False, prenorm=True),
+                           is_mask=False, prenorm=True,
+                           projection_compiled=_get_proj("slat_condition_embedder", 0)),
             slat_emb.embedder_list[0][1],
         )
         slat_emb.module_list[0] = nn.Identity()
@@ -2837,18 +2870,27 @@ class OVInferencePipelinePointMap:
         mask_dino = slat_emb.embedder_list[1][0]
         slat_emb.embedder_list[1] = (
             OVDinoEmbedder(backbone_compiled, mask_dino.embed_dim,
-                           is_mask=True, prenorm=True),
+                           is_mask=True, prenorm=True,
+                           projection_compiled=_get_proj("slat_condition_embedder", 1)),
             slat_emb.embedder_list[1][1],
         )
         slat_emb.module_list[1] = nn.Identity()
 
-        # Patch projection nets
+        # P3: projection is now applied inside OVDinoEmbedder for DINOv2
+        # embedders (indices 0, 1), so set those projection_nets to Identity.
+        # Other embedders (e.g. PointPatchEmbed at index 2) keep their own
+        # projection nets (OVEmbedderProjection or original PyTorch).
+        _dino_indices = {0, 1}  # DINOv2 image + mask embedder indices
         for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
             emb = self._pipeline.condition_embedders[stage_name]
             if hasattr(emb, "projection_nets"):
-                for i, proj_net in enumerate(emb.projection_nets):
+                for i in range(len(emb.projection_nets)):
                     proj_key = f"{stage_name}_proj_{i}_ov"
-                    if proj_key in self._compiled:
+                    if i in _dino_indices and proj_key in self._compiled:
+                        # Projection merged into OVDinoEmbedder — use Identity
+                        emb.projection_nets[i] = nn.Identity()
+                    elif proj_key in self._compiled:
+                        # Non-DINOv2 embedder — keep separate OV projection
                         emb.projection_nets[i] = OVEmbedderProjection(
                             self._compiled[proj_key]
                         )
@@ -3012,17 +3054,14 @@ class OVInferencePipelinePointMap:
     def _patch_slat_generator(self):
         """Replace the SLat generator backbone with OV model.
 
-        **Full OV mode** (``slat_generator_full_ov``):
-            The entire backbone (t_embedder + input_layer + input_blocks +
-            24 core transformer blocks + out_blocks + out_layer) runs in a
-            single OV model.  ALL ~600 M weights are in OV — zero PyTorch
-            weight dependencies.
-
-        **Legacy core-only mode** (``slat_generator_core_ov``):
-            Only the 24 core transformer blocks run in OV; the U-Net
-            input/output blocks (~46 M params) stay in PyTorch.
+        The entire backbone (t_embedder + d_embedder + input_layer +
+        input_blocks + 24 core transformer blocks + out_blocks + out_layer)
+        runs in a single OV model.  ALL ~600 M weights are in OV — zero
+        PyTorch weight dependencies.
         """
-        # ── Prefer full mode ──
+        if "slat_generator_full_ov" not in self._compiled:
+            return
+
         if "slat_generator_full_ov" in self._compiled:
             ov_full = OVSLatGeneratorFull(self._compiled["slat_generator_full_ov"])
             backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
@@ -3054,86 +3093,17 @@ class OVInferencePipelinePointMap:
                 else:
                     cond = orig_cond_emb(*cond_args, **cond_kwargs)
 
-                # Full backbone → single OV call
+                # Full backbone → single OV call (including d for distillation)
+                if d is None:
+                    d = torch.zeros_like(t)
                 feats = x[0]                         # (N, C_in)
                 coords_xyz = coords[:, 1:].float()   # (N, 3) — strip batch dim
-                out_feats = ov_full(feats, coords_xyz, t, cond)
+                out_feats = ov_full(feats, coords_xyz, t, d, cond)
                 return out_feats[None]                # (1, N, C_in)
 
             backbone.forward = _ov_forward_full
             self._pipeline._ov_slat_generator_full = ov_full
             print("[OV-SAM3D] SLat generator backbone → OV (full, all weights in OV)")
-            return
-
-        # ── Fallback: core-only mode ──
-        if "slat_generator_core_ov" not in self._compiled:
-            return
-        ov_core = OVSLatGeneratorCore(self._compiled["slat_generator_core_ov"])
-        backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
-
-        orig_cond_emb = backbone.condition_embedder
-        force_zeros = backbone.force_zeros_cond
-        bb_dtype = backbone.dtype
-
-        from sam3d_objects.model.backbone.tdfy_dit.modules.sparse import SparseTensor as SPT
-
-        def _ov_forward(x, t, *cond_args, **cond_kwargs):
-            d = cond_kwargs.pop("d", None)
-            if not torch.compiler.is_compiling():
-                if "coords" in cond_kwargs:
-                    coords_raw = cond_kwargs.pop("coords")
-                else:
-                    coords_raw = cond_args[-1]
-                    cond_args = cond_args[:-1]
-            else:
-                coords_raw = cond_args[-1]
-                cond_args = cond_args[:-1]
-            cfg_activate = cond_kwargs.pop("cfg", False)
-            coords = torch.tensor(coords_raw).to(x.device) if not isinstance(coords_raw, torch.Tensor) else coords_raw
-
-            if force_zeros and cfg_activate:
-                cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
-            else:
-                cond = orig_cond_emb(*cond_args, **cond_kwargs)
-
-            x_sparse = SPT(feats=x[0], coords=coords)
-            h = backbone.input_layer(x_sparse).type(bb_dtype)
-
-            t_emb = backbone.t_embedder(t)
-            if d is not None and hasattr(backbone, "d_embedder") and backbone.d_embedder is not None:
-                t_emb = t_emb + backbone.d_embedder(d)
-            if backbone.share_mod:
-                t_emb = backbone.adaLN_modulation(t_emb)
-            t_emb = t_emb.type(bb_dtype)
-            cond = cond.type(bb_dtype)
-
-            skips = []
-            for block in backbone.input_blocks:
-                h = block(h, t_emb)
-                skips.append(h.feats)
-
-            h_feats = h.feats
-            if backbone.pe_mode == "ape":
-                h_feats = h_feats + backbone.pos_embedder(h.coords[:, 1:]).type(bb_dtype)
-            h_feats_out = ov_core(
-                h_feats.float(), h.coords[:, 1:].float(),
-                t_emb.float(), cond.float(),
-            )
-            h = h.replace(h_feats_out.type(bb_dtype))
-
-            for block, skip in zip(backbone.out_blocks, reversed(skips)):
-                if backbone.use_skip_connection:
-                    h = block(h.replace(torch.cat([h.feats, skip], dim=1)), t_emb)
-                else:
-                    h = block(h, t_emb)
-
-            h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-            h = backbone.out_layer(h.type(x_sparse.dtype))
-            return h.feats[None]
-
-        backbone.forward = _ov_forward
-        self._pipeline._ov_slat_generator_core = ov_core
-        print("[OV-SAM3D] SLat generator backbone → OV (core only)")
 
     def _patch_slat_decoders(self):
         """Replace SLat decoder transformer blocks with OV models."""
@@ -3254,10 +3224,31 @@ class OVInferencePipelinePointMap:
             print(f"[OV-SAM3D] {orig_key} decoder → OV")
 
     def _patch_moge(self):
-        """Replace the MoGe depth model with OV wrapper."""
+        """Replace the MoGe depth model with OV wrapper.
+
+        Injects ``_ov_moge`` into the pipeline so that the patched
+        ``compute_pointmap`` can use it for real depth estimation
+        instead of falling back to synthetic pointmap data.
+        """
         if "moge_ov" in self._compiled:
             ov_moge = OVMoGe(self._compiled["moge_ov"])
             self._pipeline._ov_moge = ov_moge
+            # Also replace the original depth_model's __call__ so that
+            # any code path that calls self.depth_model(image) gets OV results
+            if hasattr(self._pipeline, "depth_model") and self._pipeline.depth_model is not None:
+                orig_depth = self._pipeline.depth_model
+
+                def _ov_depth_call(image):
+                    pts = ov_moge(image)
+                    if isinstance(pts, torch.Tensor):
+                        if pts.dim() == 4:
+                            pointmaps = pts.squeeze(0)
+                        else:
+                            pointmaps = pts
+                        return {"points": pointmaps, "pointmaps": pointmaps}
+                    return {"points": pts, "pointmaps": pts}
+
+                orig_depth.__call__ = _ov_depth_call
             print("[OV-SAM3D] MoGe depth model replaced with OV wrapper")
 
     def _patch_autocast(self):
@@ -3316,6 +3307,9 @@ class OVInferencePipelinePointMap:
         mask: Optional[Union[None, np.ndarray]] = None,
         seed: Optional[int] = None,
         pointmap=None,
+        with_texture_baking: bool = False,
+        use_vertex_color: bool = True,
+        with_mesh_postprocess: bool = False,
     ) -> dict:
         """
         Callable interface aligned with ``inference.Inference.__call__``.
@@ -3323,7 +3317,20 @@ class OVInferencePipelinePointMap:
         Merges *image* and *mask* into an RGBA array and delegates to
         ``pipeline.run()`` — exactly what the original
         ``demo_single_object.ipynb`` does via ``inference(image, mask, seed=42)``.
+
+        Parameters
+        ----------
+        with_texture_baking : bool
+            If True, bake multi-view textures onto the mesh (requires
+            a functional rendering backend). Default False.
+        use_vertex_color : bool
+            If True, use per-vertex colors on the mesh. Default True.
+        with_mesh_postprocess : bool
+            If True, simplify mesh and fill holes. Default False.
         """
+        # Clear DINOv2 inference cache from previous runs
+        OVDinoEmbedder.clear_cache()
+
         mask_uint8 = mask.astype(np.uint8) * 255
         rgba_image = np.concatenate([image[..., :3], mask_uint8[..., None]], axis=-1)
         return self._pipeline.run(
@@ -3332,10 +3339,10 @@ class OVInferencePipelinePointMap:
             seed=seed,
             pointmap=pointmap,
             stage1_only=False,
-            with_mesh_postprocess=False,
-            with_texture_baking=False,
+            with_mesh_postprocess=with_mesh_postprocess,
+            with_texture_baking=with_texture_baking,
             with_layout_postprocess=False,
-            use_vertex_color=True,
+            use_vertex_color=use_vertex_color,
         )
 
     def run(
@@ -3354,6 +3361,9 @@ class OVInferencePipelinePointMap:
         decode_formats: Optional[List[str]] = None,
     ) -> dict:
         """Run the full 3D reconstruction pipeline (advanced interface)."""
+        # Clear DINOv2 inference cache from previous runs
+        OVDinoEmbedder.clear_cache()
+
         return self._pipeline.run(
             image=image,
             mask=mask,
@@ -3439,7 +3449,7 @@ def load_compiled_models(
         "ss_decoder_ov": "ss_decoder.xml",
         "ss_generator_ov": "ss_generator.xml",
         "slat_generator_full_ov": "slat_generator_full.xml",
-        "slat_generator_core_ov": "slat_generator_core.xml",
+        # "slat_generator_core_ov" removed — use slat_generator_full_ov
         "slat_decoder_gs_ov": "slat_decoder_gs.xml",
         "slat_decoder_gs_4_ov": "slat_decoder_gs_4.xml",
         "slat_decoder_mesh_ov": "slat_decoder_mesh.xml",
