@@ -2352,6 +2352,8 @@ def convert_all_models(
         Keys like ``ss_dino_image_ov``, ``ss_dino_mask_ov``, ``ss_decoder_ov``, etc.
         Values are compiled ``ov.CompiledModel`` objects.
     """
+    import json
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     core = ov.Core()
@@ -2442,6 +2444,28 @@ def convert_all_models(
     # The mock MoGe from patch_cuda_for_cpu() has no real weights;
     # the real model is loaded later in _patch_moge() during pipeline setup.
     print("[OV-SAM3D] Skipping MoGe OV conversion — will use PyTorch on CPU")
+
+    # ── EmbedderFuser idx_emb (learned positional embeddings) ─────────
+    # These nn.Parameters live in EmbedderFuser and are added to condition
+    # tokens during forward().  They are NOT part of any OV model, so we
+    # save them to a sidecar JSON so the OV pipeline can load them without
+    # needing the original PyTorch checkpoint.
+    embedder_fuser_config: Dict[str, Any] = {}
+    for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+        if stage_name in pipeline.condition_embedders:
+            emb = pipeline.condition_embedders[stage_name]
+            if hasattr(emb, "idx_emb") and emb.idx_emb is not None:
+                embedder_fuser_config[f"{stage_name}_idx_emb"] = (
+                    emb.idx_emb.detach().cpu().float().tolist()
+                )
+                embedder_fuser_config[f"{stage_name}_use_pos_embedding"] = (
+                    emb.use_pos_embedding
+                )
+    if embedder_fuser_config:
+        _ef_cfg_path = output_dir / "embedder_fuser_config.json"
+        with open(_ef_cfg_path, "w") as _f:
+            json.dump(embedder_fuser_config, _f)
+        print(f"[OV-SAM3D] Saved EmbedderFuser idx_emb → {_ef_cfg_path}")
 
     # ── EmbedderFuser projection nets ──────────────────────────────────
     for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
@@ -2866,6 +2890,21 @@ class OVInferencePipelinePointMap:
                             self._compiled[proj_key]
                         )
 
+        # Restore EmbedderFuser idx_emb from sidecar JSON
+        _ef_cfg_path = self._ov_model_dir / "embedder_fuser_config.json"
+        if _ef_cfg_path.exists():
+            import json as _json
+            with open(_ef_cfg_path, "r") as _f:
+                _ef_cfg = _json.load(_f)
+            for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+                key = f"{stage_name}_idx_emb"
+                if key in _ef_cfg:
+                    emb = self._pipeline.condition_embedders[stage_name]
+                    emb.idx_emb.data = torch.tensor(
+                        _ef_cfg[key], dtype=torch.float32
+                    )
+            print(f"[OV-SAM3D] Loaded EmbedderFuser idx_emb from {_ef_cfg_path}")
+
         # Patch PointPatchEmbed inner attention (SS embedder only)
         if "pointpatch_embed_inner_ov" in self._compiled:
             if len(ss_emb.embedder_list) > 2:
@@ -2976,6 +3015,21 @@ class OVInferencePipelinePointMap:
                         emb.projection_nets[i] = OVEmbedderProjection(
                             self._compiled[proj_key]
                         )
+
+        # Restore EmbedderFuser idx_emb from sidecar JSON
+        _ef_cfg_path = self._ov_model_dir / "embedder_fuser_config.json"
+        if _ef_cfg_path.exists():
+            import json as _json
+            with open(_ef_cfg_path, "r") as _f:
+                _ef_cfg = _json.load(_f)
+            for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
+                key = f"{stage_name}_idx_emb"
+                if key in _ef_cfg:
+                    emb = self._pipeline.condition_embedders[stage_name]
+                    emb.idx_emb.data = torch.tensor(
+                        _ef_cfg[key], dtype=torch.float32
+                    )
+            print(f"[OV-SAM3D] Loaded EmbedderFuser idx_emb from {_ef_cfg_path}")
 
         print("[OV-SAM3D] DINOv2 embedders replaced with OV wrappers")
 
