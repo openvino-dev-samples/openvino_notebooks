@@ -2481,8 +2481,81 @@ def convert_all_models(
                     compiled[f"{proj_key}_ov"] = core.compile_model(ov_m, device)
 
     _cleanup()
+
+    # Save lightweight sidecar data for standalone OV pipeline creation
+    _save_pipeline_sidecar(pipeline, output_dir)
+
     print(f"[OV-SAM3D] All models saved to {output_dir}")
     return compiled
+
+
+def _save_pipeline_sidecar(pipeline, output_dir: Path):
+    """Save small pipeline components needed to create OV pipeline without the original.
+
+    Saved data (~5-10 MB total):
+      - Generator backbone condition_embedder state dicts (small MLPs)
+      - Backbone metadata (force_zeros_cond, latent_share_transformer, etc.)
+      - Config path for recreating the pipeline skeleton
+    """
+    import json as _json
+
+    output_dir = Path(output_dir)
+    sidecar = {}
+
+    # ── Generator backbone condition embedders + metadata ──
+    for gen_name in ["ss_generator", "slat_generator"]:
+        gen = pipeline.models.get(gen_name)
+        if gen is None:
+            continue
+        backbone = _unwrap_to_backbone(gen)
+        if backbone is None:
+            continue
+
+        prefix = gen_name  # "ss_generator" or "slat_generator"
+
+        # Save condition_embedder state dict (small MLP, ~1-5 MB)
+        if hasattr(backbone, "condition_embedder"):
+            sidecar[f"{prefix}_cond_emb"] = backbone.condition_embedder.state_dict()
+
+        # Save metadata
+        meta = {}
+        if hasattr(backbone, "force_zeros_cond"):
+            meta["force_zeros_cond"] = bool(backbone.force_zeros_cond)
+        if hasattr(backbone, "latent_share_transformer"):
+            for k, v in backbone.latent_share_transformer.items():
+                meta["latent_share_transformer"] = {
+                    str(k): list(v) if not isinstance(v, list) else v
+                }
+                break  # only first entry needed (pose latent names)
+        sidecar[f"{prefix}_meta"] = meta
+
+    # ── For core-only SLat mode: save backbone I/O block weights ──
+    slat_gen = pipeline.models.get("slat_generator")
+    if slat_gen is not None:
+        slat_bb = _unwrap_to_backbone(slat_gen)
+        if slat_bb is not None:
+            io_state = {}
+            for name, param in slat_bb.named_parameters():
+                top = name.split(".")[0]
+                # Keep: input_layer, t_embedder, d_embedder, adaLN_modulation,
+                #        input_blocks, out_blocks, out_layer, pos_embedder
+                # Skip: blocks (core transformer, in OV)
+                if top != "blocks":
+                    io_state[name] = param.data.clone()
+            sidecar["slat_backbone_io"] = io_state
+
+    # ── For non-merged mesh decoder fallback: save upsample block weights ──
+    mesh_dec = pipeline.models.get("slat_decoder_mesh")
+    if mesh_dec is not None and hasattr(mesh_dec, "upsample"):
+        up_state = {}
+        for name, param in mesh_dec.named_parameters():
+            top = name.split(".")[0]
+            if top in ("upsample", "out_layer"):
+                up_state[name] = param.data.clone()
+        sidecar["mesh_decoder_upsample_state"] = up_state
+
+    torch.save(sidecar, output_dir / "pipeline_sidecar.pt")
+    print(f"[OV-SAM3D] Saved pipeline sidecar data to {output_dir / 'pipeline_sidecar.pt'}")
 
 
 # ============================================================================
@@ -2782,7 +2855,13 @@ class OVEmbedderProjection(nn.Module):
 # 5.  OV PIPELINE — modified InferencePipelinePointMap that uses OV models
 # ============================================================================
 
-class OVInferencePipelinePointMap:
+def _get_inference_pipeline_pointmap_class():
+    """Lazy import to avoid import-order issues with patch_cuda_for_cpu()."""
+    from sam3d_objects.pipeline.inference_pipeline_pointmap import InferencePipelinePointMap
+    return InferencePipelinePointMap
+
+
+class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
     """
     A CPU / OpenVINO-accelerated version of
     ``sam3d_objects.pipeline.inference_pipeline_pointmap.InferencePipelinePointMap``.
@@ -2800,21 +2879,28 @@ class OVInferencePipelinePointMap:
 
     def __init__(
         self,
-        original_pipeline,
         compiled_models: Dict[str, Any],
         ov_model_dir: Union[str, Path] = "./ov_models",
+        *,
+        config_path: Union[str, Path, None] = None,
     ):
         """
         Parameters
         ----------
-        original_pipeline : InferencePipelinePointMap
-            The original pipeline loaded on CPU.
         compiled_models : dict
-            Dict returned by ``convert_all_models``.
+            Dict returned by ``convert_all_models`` or ``load_compiled_models``.
         ov_model_dir : str | Path
             Directory containing OV IR files and sidecar configs.
+        config_path : str | Path
+            Path to ``pipeline.yaml``.  The pipeline skeleton is recreated
+            from this config **without loading heavy checkpoint weights**,
+            then small sidecar weights are restored.
         """
-        self._pipeline = original_pipeline
+        if config_path is None:
+            raise ValueError(
+                "config_path is required. Pass the path to pipeline.yaml."
+            )
+        self._init_lightweight(config_path, ov_model_dir)
         self._compiled = compiled_models
         self._ov_model_dir = Path(ov_model_dir)
         self._patch_embedders()
@@ -2824,6 +2910,157 @@ class OVInferencePipelinePointMap:
         self._patch_slat_decoders()
         self._patch_moge()
         self._patch_autocast()
+        self._free_replaced_parameters()
+
+    # ------------------------------------------------------------------
+    #  Lightweight initialization from config (no heavy weights)
+    # ------------------------------------------------------------------
+    def _init_lightweight(self, config_path, ov_model_dir):
+        """Recreate pipeline skeleton from config without loading checkpoint weights."""
+        import warnings
+        from omegaconf import OmegaConf
+        from hydra.utils import instantiate
+        import safetensors.torch as _sft
+
+        config_path = Path(config_path)
+        ov_model_dir = Path(ov_model_dir)
+
+        config = OmegaConf.load(str(config_path))
+        config = patch_pipeline_config(config)
+        config.workspace_dir = str(config_path.parent)
+
+        # Monkey-patch weight loading to return empty dicts — model structures
+        # are created with random/initialized weights (correct shapes, no I/O).
+        _orig_load_file = _sft.load_file
+        _orig_torch_load = torch.load
+
+        def _noop_load_file(*_a, **_kw):
+            return {}
+
+        def _noop_torch_load(*_a, **_kw):
+            return {"state_dict": {}}
+
+        _sft.load_file = _noop_load_file
+        torch.load = _noop_torch_load
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                skeleton = instantiate(config)
+        finally:
+            _sft.load_file = _orig_load_file
+            torch.load = _orig_torch_load
+
+        # Transfer skeleton state to self
+        self.__dict__.update(skeleton.__dict__)
+        del skeleton
+
+        # Restore small needed weights from sidecar
+        self._restore_sidecar_weights(ov_model_dir)
+        print("[OV-SAM3D] Lightweight pipeline created from config (no heavy weights loaded)")
+
+    def _restore_sidecar_weights(self, ov_model_dir):
+        """Load small component weights saved by _save_pipeline_sidecar()."""
+        sidecar_path = Path(ov_model_dir) / "pipeline_sidecar.pt"
+        if not sidecar_path.exists():
+            print(f"[OV-SAM3D] WARNING: {sidecar_path} not found, "
+                  "skipping sidecar weight restoration")
+            return
+
+        sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=False)
+
+        # Restore generator backbone condition_embedders
+        for gen_name in ["ss_generator", "slat_generator"]:
+            cond_key = f"{gen_name}_cond_emb"
+            if cond_key in sidecar:
+                gen = self.models.get(gen_name)
+                if gen is not None:
+                    backbone = _unwrap_to_backbone(gen)
+                    if backbone is not None and hasattr(backbone, "condition_embedder"):
+                        backbone.condition_embedder.load_state_dict(
+                            sidecar[cond_key], strict=False
+                        )
+
+        # Restore SLat backbone I/O block weights (for core-only mode)
+        if "slat_backbone_io" in sidecar:
+            slat_gen = self.models.get("slat_generator")
+            if slat_gen is not None:
+                slat_bb = _unwrap_to_backbone(slat_gen)
+                if slat_bb is not None:
+                    # Load only matching keys
+                    bb_state = slat_bb.state_dict()
+                    for k, v in sidecar["slat_backbone_io"].items():
+                        if k in bb_state and bb_state[k].shape == v.shape:
+                            bb_state[k] = v
+                    slat_bb.load_state_dict(bb_state, strict=False)
+
+        # Restore mesh decoder upsample weights (for non-merged fallback)
+        if "mesh_decoder_upsample_state" in sidecar:
+            mesh_dec = self.models.get("slat_decoder_mesh")
+            if mesh_dec is not None:
+                dec_state = mesh_dec.state_dict()
+                for k, v in sidecar["mesh_decoder_upsample_state"].items():
+                    if k in dec_state and dec_state[k].shape == v.shape:
+                        dec_state[k] = v
+                mesh_dec.load_state_dict(dec_state, strict=False)
+
+        print(f"[OV-SAM3D] Restored sidecar weights from {sidecar_path}")
+
+    def _free_replaced_parameters(self):
+        """Free PyTorch parameters that have been replaced by OV compiled models."""
+        import gc
+
+        freed = 0
+        # Free DINOv2 backbone weights inside condition embedders
+        # (replaced by OVDinoEmbedder — the original nn.Module is gone)
+        # Nothing to do here — embedder_list entries are replaced objects.
+
+        # Free generator backbone core transformer weights
+        # (replaced by OV, but condition_embedder is still needed)
+        for gen_name in ["ss_generator", "slat_generator"]:
+            gen = self.models.get(gen_name)
+            if gen is None:
+                continue
+            backbone = _unwrap_to_backbone(gen)
+            if backbone is None:
+                continue
+            kept_prefixes = {"condition_embedder"}
+            # For core-only SLat mode, also keep I/O blocks
+            if gen_name == "slat_generator" and not hasattr(self, "_ov_slat_generator_full"):
+                kept_prefixes.update({
+                    "input_layer", "t_embedder", "d_embedder",
+                    "adaLN_modulation", "input_blocks", "out_blocks",
+                    "out_layer", "pos_embedder",
+                })
+            for name, param in list(backbone.named_parameters()):
+                top = name.split(".")[0]
+                if top not in kept_prefixes:
+                    n = param.numel() * param.element_size()
+                    param.data = torch.empty(0, dtype=param.dtype)
+                    freed += n
+
+        # Free SS decoder weights (fully replaced by OVSSDecoder)
+        ss_dec = self.models.get("ss_decoder")
+        if ss_dec is not None and isinstance(ss_dec, OVSSDecoder):
+            pass  # Already an OV wrapper, no PyTorch params to free
+
+        # Free decoder transformer weights (forward replaced by OV)
+        # Keep out_layer and to_representation weights (used in PyTorch)
+        for dec_name in ["slat_decoder_gs", "slat_decoder_gs_4", "slat_decoder_mesh"]:
+            dec = self.models.get(dec_name)
+            if dec is None:
+                continue
+            kept_prefixes = {"out_layer", "upsample", "mesh_extractor"}
+            for name, param in list(dec.named_parameters()):
+                top = name.split(".")[0]
+                if top not in kept_prefixes:
+                    n = param.numel() * param.element_size()
+                    param.data = torch.empty(0, dtype=param.dtype)
+                    freed += n
+
+        gc.collect()
+        if freed > 0:
+            print(f"[OV-SAM3D] Freed {freed / (1024**2):.0f} MB of replaced PyTorch parameters")
 
     # ------------------------------------------------------------------
     #  Internal patching
@@ -2844,7 +3081,7 @@ class OVInferencePipelinePointMap:
         backbone_compiled = self._compiled["dino_backbone_ov"]
 
         # SS condition embedder (prenorm=False → output index 0)
-        ss_emb = self._pipeline.condition_embedders["ss_condition_embedder"]
+        ss_emb = self.condition_embedders["ss_condition_embedder"]
         img_dino = ss_emb.embedder_list[0][0]
         ss_emb.embedder_list[0] = (
             OVDinoEmbedder(backbone_compiled, img_dino.embed_dim,
@@ -2862,7 +3099,7 @@ class OVInferencePipelinePointMap:
         ss_emb.module_list[1] = nn.Identity()
 
         # SLat condition embedder (prenorm=True → output index 1)
-        slat_emb = self._pipeline.condition_embedders["slat_condition_embedder"]
+        slat_emb = self.condition_embedders["slat_condition_embedder"]
         img_dino = slat_emb.embedder_list[0][0]
         slat_emb.embedder_list[0] = (
             OVDinoEmbedder(backbone_compiled, img_dino.embed_dim,
@@ -2881,7 +3118,7 @@ class OVInferencePipelinePointMap:
 
         # Patch projection nets
         for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
-            emb = self._pipeline.condition_embedders[stage_name]
+            emb = self.condition_embedders[stage_name]
             if hasattr(emb, "projection_nets"):
                 for i, proj_net in enumerate(emb.projection_nets):
                     proj_key = f"{stage_name}_proj_{i}_ov"
@@ -2899,7 +3136,7 @@ class OVInferencePipelinePointMap:
             for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
                 key = f"{stage_name}_idx_emb"
                 if key in _ef_cfg:
-                    emb = self._pipeline.condition_embedders[stage_name]
+                    emb = self.condition_embedders[stage_name]
                     emb.idx_emb.data = torch.tensor(
                         _ef_cfg[key], dtype=torch.float32
                     )
@@ -2958,7 +3195,7 @@ class OVInferencePipelinePointMap:
     def _patch_embedders_legacy(self):
         """Legacy: patch using separate per-model DINOv2 OV files."""
         # SS condition embedder
-        ss_emb = self._pipeline.condition_embedders["ss_condition_embedder"]
+        ss_emb = self.condition_embedders["ss_condition_embedder"]
         if "ss_dino_image_ov" in self._compiled:
             img_dino = ss_emb.embedder_list[0][0]
             ov_img = OVDinoEmbedder(
@@ -2982,7 +3219,7 @@ class OVInferencePipelinePointMap:
             ss_emb.module_list[1] = nn.Identity()
 
         # SLat condition embedder
-        slat_emb = self._pipeline.condition_embedders["slat_condition_embedder"]
+        slat_emb = self.condition_embedders["slat_condition_embedder"]
         if "slat_dino_image_ov" in self._compiled:
             img_dino = slat_emb.embedder_list[0][0]
             ov_img = OVDinoEmbedder(
@@ -3007,7 +3244,7 @@ class OVInferencePipelinePointMap:
 
         # Patch projection nets
         for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
-            emb = self._pipeline.condition_embedders[stage_name]
+            emb = self.condition_embedders[stage_name]
             if hasattr(emb, "projection_nets"):
                 for i, proj_net in enumerate(emb.projection_nets):
                     proj_key = f"{stage_name}_proj_{i}_ov"
@@ -3025,7 +3262,7 @@ class OVInferencePipelinePointMap:
             for stage_name in ["ss_condition_embedder", "slat_condition_embedder"]:
                 key = f"{stage_name}_idx_emb"
                 if key in _ef_cfg:
-                    emb = self._pipeline.condition_embedders[stage_name]
+                    emb = self.condition_embedders[stage_name]
                     emb.idx_emb.data = torch.tensor(
                         _ef_cfg[key], dtype=torch.float32
                     )
@@ -3037,7 +3274,7 @@ class OVInferencePipelinePointMap:
         """Replace the SS decoder with OV wrapper."""
         if "ss_decoder_ov" in self._compiled:
             ov_dec = OVSSDecoder(self._compiled["ss_decoder_ov"])
-            self._pipeline.models["ss_decoder"] = ov_dec
+            self.models["ss_decoder"] = ov_dec
             print("[OV-SAM3D] SS decoder replaced with OV wrapper")
 
     def _patch_ss_generator(self):
@@ -3045,7 +3282,7 @@ class OVInferencePipelinePointMap:
         if "ss_generator_ov" not in self._compiled:
             return
         ov_gen = OVSSGenerator(self._compiled["ss_generator_ov"])
-        backbone = _unwrap_to_backbone(self._pipeline.models["ss_generator"])
+        backbone = _unwrap_to_backbone(self.models["ss_generator"])
 
         # Discover pose latent names from the backbone's config
         pose_names = []
@@ -3073,7 +3310,7 @@ class OVInferencePipelinePointMap:
             return output
 
         backbone.forward = _ov_forward
-        self._pipeline._ov_ss_generator = ov_gen
+        self._ov_ss_generator = ov_gen
         print("[OV-SAM3D] SS generator backbone → OV")
 
     def _patch_slat_generator(self):
@@ -3092,7 +3329,7 @@ class OVInferencePipelinePointMap:
         # ── Prefer full mode ──
         if "slat_generator_full_ov" in self._compiled:
             ov_full = OVSLatGeneratorFull(self._compiled["slat_generator_full_ov"])
-            backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
+            backbone = _unwrap_to_backbone(self.models["slat_generator"])
 
             orig_cond_emb = backbone.condition_embedder
             force_zeros = backbone.force_zeros_cond
@@ -3128,7 +3365,7 @@ class OVInferencePipelinePointMap:
                 return out_feats[None]                # (1, N, C_in)
 
             backbone.forward = _ov_forward_full
-            self._pipeline._ov_slat_generator_full = ov_full
+            self._ov_slat_generator_full = ov_full
             print("[OV-SAM3D] SLat generator backbone → OV (full, all weights in OV)")
             return
 
@@ -3136,7 +3373,7 @@ class OVInferencePipelinePointMap:
         if "slat_generator_core_ov" not in self._compiled:
             return
         ov_core = OVSLatGeneratorCore(self._compiled["slat_generator_core_ov"])
-        backbone = _unwrap_to_backbone(self._pipeline.models["slat_generator"])
+        backbone = _unwrap_to_backbone(self.models["slat_generator"])
 
         orig_cond_emb = backbone.condition_embedder
         force_zeros = backbone.force_zeros_cond
@@ -3199,7 +3436,7 @@ class OVInferencePipelinePointMap:
             return h.feats[None]
 
         backbone.forward = _ov_forward
-        self._pipeline._ov_slat_generator_core = ov_core
+        self._ov_slat_generator_core = ov_core
         print("[OV-SAM3D] SLat generator backbone → OV (core only)")
 
     def _patch_slat_decoders(self):
@@ -3208,12 +3445,12 @@ class OVInferencePipelinePointMap:
             if not (key.startswith("slat_decoder_") and key.endswith("_ov")):
                 continue
             orig_key = key[:-3]  # e.g. "slat_decoder_gs"
-            if orig_key not in self._pipeline.models:
+            if orig_key not in self.models:
                 continue
 
             # ── Mesh decoder ──
             if orig_key == "slat_decoder_mesh":
-                decoder = self._pipeline.models[orig_key]
+                decoder = self.models[orig_key]
                 orig_to_rep = decoder.to_representation
 
                 # ── Prefer merged model (base + upsample in one OV call) ──
@@ -3252,10 +3489,10 @@ class OVInferencePipelinePointMap:
                     decoder.forward = _make_ov_mesh_forward_merged(
                         ov_merged, orig_to_rep,
                     )
-                    self._pipeline._ov_slat_decoders = getattr(
-                        self._pipeline, "_ov_slat_decoders", {}
+                    self._ov_slat_decoders = getattr(
+                        self, "_ov_slat_decoders", {}
                     )
-                    self._pipeline._ov_slat_decoders[orig_key] = ov_merged
+                    self._ov_slat_decoders[orig_key] = ov_merged
                     print(f"[OV-SAM3D] {orig_key} → OV merged (base+upsample) + FlexiCubes")
                     continue
 
@@ -3319,12 +3556,12 @@ class OVInferencePipelinePointMap:
                     ov_mesh_base, ov_upsample, orig_upsample,
                     orig_out_layer, orig_to_rep,
                 )
-                self._pipeline._ov_slat_decoders = getattr(
-                    self._pipeline, "_ov_slat_decoders", {}
+                self._ov_slat_decoders = getattr(
+                    self, "_ov_slat_decoders", {}
                 )
-                self._pipeline._ov_slat_decoders[orig_key] = ov_mesh_base
+                self._ov_slat_decoders[orig_key] = ov_mesh_base
                 if has_ov_upsample:
-                    self._pipeline._ov_slat_decoders["mesh_upsample"] = ov_upsample
+                    self._ov_slat_decoders["mesh_upsample"] = ov_upsample
                     print(f"[OV-SAM3D] {orig_key} → OV base + OV upsample + FlexiCubes")
                 else:
                     print(f"[OV-SAM3D] {orig_key} → OV base + PyTorch upsample/FlexiCubes")
@@ -3332,7 +3569,7 @@ class OVInferencePipelinePointMap:
 
             # ── GS / GS-4 decoders: full OV replacement ──
             ov_dec = OVSLatDecoder(compiled)
-            decoder = self._pipeline.models[orig_key]
+            decoder = self.models[orig_key]
             orig_to_rep = decoder.to_representation
 
             def _make_ov_decoder_forward(_ov_dec, _orig_to_rep):
@@ -3346,10 +3583,10 @@ class OVInferencePipelinePointMap:
                 return _ov_forward
 
             decoder.forward = _make_ov_decoder_forward(ov_dec, orig_to_rep)
-            self._pipeline._ov_slat_decoders = getattr(
-                self._pipeline, "_ov_slat_decoders", {}
+            self._ov_slat_decoders = getattr(
+                self, "_ov_slat_decoders", {}
             )
-            self._pipeline._ov_slat_decoders[orig_key] = ov_dec
+            self._ov_slat_decoders[orig_key] = ov_dec
             print(f"[OV-SAM3D] {orig_key} decoder → OV")
 
     def _patch_moge(self):
@@ -3359,7 +3596,7 @@ class OVInferencePipelinePointMap:
         depth data.  This method replaces it with the real MoGe model running
         on CPU via PyTorch (not converted to OV — per user decision).
         """
-        _pipeline = self._pipeline
+        _pipeline = self
 
         try:
             real_moge = load_real_moge_cpu()
@@ -3463,7 +3700,7 @@ class OVInferencePipelinePointMap:
         import sam3d_objects.pipeline.inference_pipeline_pointmap as _ipm
 
         # Patch sample_sparse_structure to use CPU-safe autocast
-        _orig_ss = self._pipeline.sample_sparse_structure
+        _orig_ss = self.sample_sparse_structure
 
         def _sample_ss_cpu(ss_input_dict, inference_steps=None, use_distillation=False):
             # Temporarily replace torch.autocast in the method scope
@@ -3474,10 +3711,10 @@ class OVInferencePipelinePointMap:
             finally:
                 torch.autocast = orig_autocast
 
-        self._pipeline.sample_sparse_structure = _sample_ss_cpu
+        self.sample_sparse_structure = _sample_ss_cpu
 
         # Patch sample_slat
-        _orig_slat = self._pipeline.sample_slat
+        _orig_slat = self.sample_slat
 
         def _sample_slat_cpu(slat_input, coords, inference_steps=25, use_distillation=False):
             orig_autocast = torch.autocast
@@ -3487,10 +3724,10 @@ class OVInferencePipelinePointMap:
             finally:
                 torch.autocast = orig_autocast
 
-        self._pipeline.sample_slat = _sample_slat_cpu
+        self.sample_slat = _sample_slat_cpu
 
         # Patch compute_pointmap (depth model)
-        _orig_pm = self._pipeline.compute_pointmap
+        _orig_pm = self.compute_pointmap
 
         def _compute_pointmap_cpu(image, pointmap=None):
             orig_autocast = torch.autocast
@@ -3500,7 +3737,7 @@ class OVInferencePipelinePointMap:
             finally:
                 torch.autocast = orig_autocast
 
-        self._pipeline.compute_pointmap = _compute_pointmap_cpu
+        self.compute_pointmap = _compute_pointmap_cpu
         print("[OV-SAM3D] Autocast patched for CPU inference")
 
     # ------------------------------------------------------------------
@@ -3518,12 +3755,12 @@ class OVInferencePipelinePointMap:
         Callable interface aligned with ``inference.Inference.__call__``.
 
         Merges *image* and *mask* into an RGBA array and delegates to
-        ``pipeline.run()`` — exactly what the original
+        ``self.run()`` — exactly what the original
         ``demo_single_object.ipynb`` does via ``inference(image, mask, seed=42)``.
         """
         mask_uint8 = mask.astype(np.uint8) * 255
         rgba_image = np.concatenate([image[..., :3], mask_uint8[..., None]], axis=-1)
-        return self._pipeline.run(
+        return self.run(
             image=rgba_image,
             mask=None,
             seed=seed,
@@ -3533,37 +3770,6 @@ class OVInferencePipelinePointMap:
             with_texture_baking=False,
             with_layout_postprocess=False,
             use_vertex_color=True,
-        )
-
-    def run(
-        self,
-        image: Union[np.ndarray, "PIL.Image.Image"],
-        mask: Optional[np.ndarray] = None,
-        seed: Optional[int] = None,
-        pointmap=None,
-        stage1_only: bool = False,
-        with_mesh_postprocess: bool = False,
-        with_texture_baking: bool = False,
-        with_layout_postprocess: bool = False,
-        use_vertex_color: bool = True,
-        stage1_inference_steps: Optional[int] = None,
-        stage2_inference_steps: Optional[int] = None,
-        decode_formats: Optional[List[str]] = None,
-    ) -> dict:
-        """Run the full 3D reconstruction pipeline (advanced interface)."""
-        return self._pipeline.run(
-            image=image,
-            mask=mask,
-            seed=seed,
-            pointmap=pointmap,
-            stage1_only=stage1_only,
-            with_mesh_postprocess=with_mesh_postprocess,
-            with_texture_baking=with_texture_baking,
-            with_layout_postprocess=with_layout_postprocess,
-            use_vertex_color=use_vertex_color,
-            stage1_inference_steps=stage1_inference_steps,
-            stage2_inference_steps=stage2_inference_steps,
-            decode_formats=decode_formats,
         )
 
 
@@ -3603,17 +3809,19 @@ def create_ov_pipeline(
     config = patch_pipeline_config(config)
     config.workspace_dir = str(config_path.parent)
 
-    print("[OV-SAM3D] Instantiating pipeline on CPU …")
-    pipeline = instantiate(config)
-
-    # Convert / load OV models
     ov_model_dir = Path(ov_model_dir)
+
     if convert:
+        print("[OV-SAM3D] Instantiating pipeline on CPU …")
+        pipeline = instantiate(config)
         compiled = convert_all_models(pipeline, ov_model_dir, device=ov_device)
+        del pipeline  # free heavy weights before creating OV pipeline
     else:
         compiled = load_compiled_models(ov_model_dir, ov_device)
 
-    return OVInferencePipelinePointMap(pipeline, compiled, ov_model_dir=ov_model_dir)
+    return OVInferencePipelinePointMap(
+        compiled, ov_model_dir=ov_model_dir, config_path=config_path,
+    )
 
 
 def load_compiled_models(
