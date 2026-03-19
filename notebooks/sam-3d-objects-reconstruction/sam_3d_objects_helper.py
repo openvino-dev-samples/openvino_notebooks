@@ -94,12 +94,24 @@ class CPUTransform3d:
 
     def scale(self, x, y=None, z=None):
         if isinstance(x, torch.Tensor):
+            if x.numel() == 0:
+                # Empty tensor — treat as identity scale
+                return self
             if x.dim() == 0:
                 xyz = x.expand(3)
             elif x.dim() == 1 and x.shape[0] == 1:
                 xyz = x.expand(3)
             elif x.dim() == 1 and x.shape[0] == 3:
                 xyz = x
+            elif x.dim() >= 2:
+                # Batched scale: shape (..., 3)
+                flat = x.reshape(-1)
+                if flat.numel() >= 3:
+                    xyz = flat[:3]
+                elif flat.numel() == 1:
+                    xyz = flat.expand(3)
+                else:
+                    return self
             else:
                 xyz = x.reshape(-1)[:3]
         else:
@@ -261,6 +273,13 @@ def _cpu_quaternion_invert(q):
     conj = q.clone()
     conj[..., 1:] = -conj[..., 1:]
     return conj / (q.norm(dim=-1, keepdim=True) ** 2).clamp(min=1e-10)
+
+
+def _moduledict_get(md, key, default=None):
+    """Safe ``.get()`` for ``nn.ModuleDict`` (which has no ``.get()``)."""
+    if key in md:
+        return md[key]
+    return default
 
 
 # ============================================================================
@@ -2504,7 +2523,7 @@ def _save_pipeline_sidecar(pipeline, output_dir: Path):
 
     # ── Generator backbone condition embedders + metadata ──
     for gen_name in ["ss_generator", "slat_generator"]:
-        gen = pipeline.models.get(gen_name)
+        gen = _moduledict_get(pipeline.models, gen_name)
         if gen is None:
             continue
         backbone = _unwrap_to_backbone(gen)
@@ -2514,8 +2533,9 @@ def _save_pipeline_sidecar(pipeline, output_dir: Path):
         prefix = gen_name  # "ss_generator" or "slat_generator"
 
         # Save condition_embedder state dict (small MLP, ~1-5 MB)
-        if hasattr(backbone, "condition_embedder"):
-            sidecar[f"{prefix}_cond_emb"] = backbone.condition_embedder.state_dict()
+        cond_emb = getattr(backbone, "condition_embedder", None)
+        if cond_emb is not None and isinstance(cond_emb, nn.Module):
+            sidecar[f"{prefix}_cond_emb"] = cond_emb.state_dict()
 
         # Save metadata
         meta = {}
@@ -2529,8 +2549,15 @@ def _save_pipeline_sidecar(pipeline, output_dir: Path):
                 break  # only first entry needed (pose latent names)
         sidecar[f"{prefix}_meta"] = meta
 
+        # Save latent_mapping state dict (pos_emb + projection layers)
+        # Needed so the skeleton has correct token counts for noise generation
+        if hasattr(backbone, "latent_mapping"):
+            sidecar[f"{prefix}_latent_mapping"] = {
+                k: v.clone() for k, v in backbone.latent_mapping.state_dict().items()
+            }
+
     # ── For core-only SLat mode: save backbone I/O block weights ──
-    slat_gen = pipeline.models.get("slat_generator")
+    slat_gen = _moduledict_get(pipeline.models, "slat_generator")
     if slat_gen is not None:
         slat_bb = _unwrap_to_backbone(slat_gen)
         if slat_bb is not None:
@@ -2545,7 +2572,7 @@ def _save_pipeline_sidecar(pipeline, output_dir: Path):
             sidecar["slat_backbone_io"] = io_state
 
     # ── For non-merged mesh decoder fallback: save upsample block weights ──
-    mesh_dec = pipeline.models.get("slat_decoder_mesh")
+    mesh_dec = _moduledict_get(pipeline.models, "slat_decoder_mesh")
     if mesh_dec is not None and hasattr(mesh_dec, "upsample"):
         up_state = {}
         for name, param in mesh_dec.named_parameters():
@@ -2861,20 +2888,19 @@ def _get_inference_pipeline_pointmap_class():
     return InferencePipelinePointMap
 
 
-class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
-    """
-    A CPU / OpenVINO-accelerated version of
-    ``sam3d_objects.pipeline.inference_pipeline_pointmap.InferencePipelinePointMap``.
+# The real class (inheriting from InferencePipelinePointMap) is built
+# lazily by ``_ensure_ov_pipeline_class_ready()`` — the first call to
+# ``OVInferencePipelinePointMap(...)`` triggers it.  At module-import
+# time we only define a thin wrapper that defers class creation until
+# ``patch_cuda_for_cpu()`` has installed the required mocks.
 
-    Usage
-    -----
-    >>> helper = __import__("sam_3d_objects_helper")
-    >>> helper.patch_cuda_for_cpu()
-    >>> pipeline = helper.create_ov_pipeline(
-    ...     config_path="path/to/pipeline.yaml",
-    ...     ov_model_dir="./ov_models",
-    ... )
-    >>> output = pipeline.run(image, mask, seed=42)
+class _OVPipelineMixin:
+    """Holds ALL OVInferencePipelinePointMap methods.
+
+    Defined at module level (no sam3d_objects dependency).
+    ``_ensure_ov_pipeline_class()`` dynamically sets the real base
+    class (InferencePipelinePointMap) onto this mixin via ``__bases__``
+    manipulation — see below.
     """
 
     def __init__(
@@ -2929,19 +2955,23 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
         config = patch_pipeline_config(config)
         config.workspace_dir = str(config_path.parent)
 
-        # Monkey-patch weight loading to return empty dicts — model structures
-        # are created with random/initialized weights (correct shapes, no I/O).
+        # Patch ONLY the SAM3D model loading to skip weights — DINOv2 hub
+        # loading (torch.hub.load) must still work because it creates the
+        # ViT architecture.  We do NOT replace torch.load globally.
         _orig_load_file = _sft.load_file
-        _orig_torch_load = torch.load
+        _sft.load_file = lambda *_a, **_kw: {}
 
-        def _noop_load_file(*_a, **_kw):
-            return {}
+        # Patch load_model_from_checkpoint to return model with empty state dict
+        from sam3d_objects.model import io as _io_mod
+        from sam3d_objects.pipeline import inference_pipeline as _ip_mod2
+        _orig_load_ckpt = _io_mod.load_model_from_checkpoint
 
-        def _noop_torch_load(*_a, **_kw):
-            return {"state_dict": {}}
+        def _noop_load_ckpt(model, ckpt_path, **kwargs):
+            """Skip checkpoint loading — return model as-is."""
+            return model
 
-        _sft.load_file = _noop_load_file
-        torch.load = _noop_torch_load
+        _io_mod.load_model_from_checkpoint = _noop_load_ckpt
+        _ip_mod2.load_model_from_checkpoint = _noop_load_ckpt
 
         try:
             with warnings.catch_warnings():
@@ -2949,7 +2979,8 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
                 skeleton = instantiate(config)
         finally:
             _sft.load_file = _orig_load_file
-            torch.load = _orig_torch_load
+            _io_mod.load_model_from_checkpoint = _orig_load_ckpt
+            _ip_mod2.load_model_from_checkpoint = _orig_load_ckpt
 
         # Transfer skeleton state to self
         self.__dict__.update(skeleton.__dict__)
@@ -2973,17 +3004,45 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
         for gen_name in ["ss_generator", "slat_generator"]:
             cond_key = f"{gen_name}_cond_emb"
             if cond_key in sidecar:
-                gen = self.models.get(gen_name)
+                gen = _moduledict_get(self.models, gen_name)
                 if gen is not None:
                     backbone = _unwrap_to_backbone(gen)
-                    if backbone is not None and hasattr(backbone, "condition_embedder"):
-                        backbone.condition_embedder.load_state_dict(
+                    cond_emb = getattr(backbone, "condition_embedder", None) if backbone else None
+                    if cond_emb is not None and isinstance(cond_emb, nn.Module):
+                        cond_emb.load_state_dict(
                             sidecar[cond_key], strict=False
                         )
 
+        # Restore SS generator latent_mapping (pos_emb + projection layers)
+        # Skeleton model has empty pos_emb for pose entries; we need correct shapes
+        for gen_name in ["ss_generator", "slat_generator"]:
+            lm_key = f"{gen_name}_latent_mapping"
+            if lm_key not in sidecar:
+                continue
+            gen = _moduledict_get(self.models, gen_name)
+            if gen is None:
+                continue
+            backbone = _unwrap_to_backbone(gen)
+            if backbone is None or not hasattr(backbone, "latent_mapping"):
+                continue
+            saved_lm = sidecar[lm_key]
+            # Manual assignment handles shape mismatches (e.g. pos_emb [0] → [1, 1024])
+            for param_name, saved_tensor in saved_lm.items():
+                parts = param_name.split(".")
+                # Navigate to the parameter's parent module
+                mod = backbone.latent_mapping
+                for part in parts[:-1]:
+                    mod = getattr(mod, part)
+                attr = parts[-1]
+                old = getattr(mod, attr, None)
+                if old is not None and isinstance(old, nn.Parameter):
+                    setattr(mod, attr, nn.Parameter(saved_tensor, requires_grad=False))
+                elif old is not None and isinstance(old, torch.Tensor):
+                    setattr(mod, attr, saved_tensor)
+
         # Restore SLat backbone I/O block weights (for core-only mode)
         if "slat_backbone_io" in sidecar:
-            slat_gen = self.models.get("slat_generator")
+            slat_gen = _moduledict_get(self.models, "slat_generator")
             if slat_gen is not None:
                 slat_bb = _unwrap_to_backbone(slat_gen)
                 if slat_bb is not None:
@@ -2996,7 +3055,7 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
 
         # Restore mesh decoder upsample weights (for non-merged fallback)
         if "mesh_decoder_upsample_state" in sidecar:
-            mesh_dec = self.models.get("slat_decoder_mesh")
+            mesh_dec = _moduledict_get(self.models, "slat_decoder_mesh")
             if mesh_dec is not None:
                 dec_state = mesh_dec.state_dict()
                 for k, v in sidecar["mesh_decoder_upsample_state"].items():
@@ -3018,13 +3077,13 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
         # Free generator backbone core transformer weights
         # (replaced by OV, but condition_embedder is still needed)
         for gen_name in ["ss_generator", "slat_generator"]:
-            gen = self.models.get(gen_name)
+            gen = _moduledict_get(self.models, gen_name)
             if gen is None:
                 continue
             backbone = _unwrap_to_backbone(gen)
             if backbone is None:
                 continue
-            kept_prefixes = {"condition_embedder"}
+            kept_prefixes = {"condition_embedder", "latent_mapping"}
             # For core-only SLat mode, also keep I/O blocks
             if gen_name == "slat_generator" and not hasattr(self, "_ov_slat_generator_full"):
                 kept_prefixes.update({
@@ -3040,14 +3099,14 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
                     freed += n
 
         # Free SS decoder weights (fully replaced by OVSSDecoder)
-        ss_dec = self.models.get("ss_decoder")
+        ss_dec = _moduledict_get(self.models, "ss_decoder")
         if ss_dec is not None and isinstance(ss_dec, OVSSDecoder):
             pass  # Already an OV wrapper, no PyTorch params to free
 
         # Free decoder transformer weights (forward replaced by OV)
         # Keep out_layer and to_representation weights (used in PyTorch)
         for dec_name in ["slat_decoder_gs", "slat_decoder_gs_4", "slat_decoder_mesh"]:
-            dec = self.models.get(dec_name)
+            dec = _moduledict_get(self.models, dec_name)
             if dec is None:
                 continue
             kept_prefixes = {"out_layer", "upsample", "mesh_extractor"}
@@ -3773,6 +3832,43 @@ class OVInferencePipelinePointMap(_get_inference_pipeline_pointmap_class()):
         )
 
 
+def _ensure_ov_pipeline_class():
+    """Dynamically create a class that inherits from
+    ``InferencePipelinePointMap`` and has all ``_OVPipelineMixin`` methods.
+
+    Uses ``type()`` to build the class at runtime because CPython forbids
+    ``__bases__`` reassignment when the deallocator differs.
+    """
+    global _ov_pipeline_cls_cache
+    try:
+        if _ov_pipeline_cls_cache is not None:
+            return _ov_pipeline_cls_cache
+    except NameError:
+        pass
+
+    base_cls = _get_inference_pipeline_pointmap_class()
+    # Collect all methods / attrs defined in _OVPipelineMixin (skip dunder noise)
+    ns = {
+        k: v for k, v in _OVPipelineMixin.__dict__.items()
+        if not (k.startswith("__") and k.endswith("__") and k != "__init__" and k != "__call__")
+    }
+    _ov_pipeline_cls_cache = type("OVInferencePipelinePointMap", (base_cls,), ns)
+    return _ov_pipeline_cls_cache
+
+_ov_pipeline_cls_cache = None
+
+
+def OVInferencePipelinePointMap(*args, **kwargs):
+    """Public factory — creates an OV-accelerated pipeline instance.
+
+    On the first call this resolves the real base class
+    (``InferencePipelinePointMap``) by calling ``_ensure_ov_pipeline_class()``.
+    Subsequent calls reuse the cached class.
+    """
+    cls = _ensure_ov_pipeline_class()
+    return cls(*args, **kwargs)
+
+
 # ============================================================================
 # 6.  FACTORY — one-call pipeline creation
 # ============================================================================
@@ -3782,7 +3878,7 @@ def create_ov_pipeline(
     ov_model_dir: Union[str, Path] = "./ov_models",
     ov_device: str = "CPU",
     convert: bool = True,
-) -> OVInferencePipelinePointMap:
+):
     """
     End-to-end helper: load → patch → convert → wrap.
 
