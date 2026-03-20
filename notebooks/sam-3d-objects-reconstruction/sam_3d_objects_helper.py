@@ -559,10 +559,60 @@ def patch_cuda_for_cpu():
         ("moge.model", None),
         ("moge.model.v1", {"MoGeModel": _MockMoGeModel}),
         ("moge.utils", None),
-        ("moge.utils.geometry_numpy", None),
-        ("moge.utils.geometry_torch", None),
     ]:
         _ensure_mock(mod, attrs)
+
+    # Restore real moge.utils geometry modules (CPU-safe, no CUDA deps).
+    # These are needed by OVMoGe for recover_focal_shift post-processing.
+    # The modules use relative imports, so we must set __path__ on the
+    # mock moge.utils package and load dependencies in order.
+    _moge_utils_dir = None
+    for _sp in (
+        [getattr(__import__("site"), "getusersitepackages", lambda: "")()]
+        if isinstance(getattr(__import__("site"), "getusersitepackages", lambda: "")(), str)
+        else getattr(__import__("site"), "getusersitepackages", lambda: [])()
+    ) + getattr(__import__("site"), "getsitepackages", lambda: [])():
+        _candidate = Path(_sp) / "moge" / "utils"
+        if _candidate.is_dir():
+            _moge_utils_dir = _candidate
+            break
+    if _moge_utils_dir is None:
+        for _sp_path in sys.path:
+            _candidate = Path(_sp_path) / "moge" / "utils"
+            if _candidate.is_dir() and (_candidate / "geometry_torch.py").exists():
+                _moge_utils_dir = _candidate
+                break
+
+    if _moge_utils_dir is not None:
+        import importlib.util as _ilu
+        # Set __path__ on mock moge and moge.utils so relative imports work
+        _moge_mock = sys.modules.get("moge")
+        if _moge_mock is not None:
+            _moge_mock.__path__ = [str(_moge_utils_dir.parent)]
+        _moge_utils_mock = sys.modules.get("moge.utils")
+        if _moge_utils_mock is not None:
+            _moge_utils_mock.__path__ = [str(_moge_utils_dir)]
+            _moge_utils_mock.__package__ = "moge.utils"
+
+        # Load real modules in dependency order: tools → geometry_numpy → geometry_torch
+        for _mod_name, _mod_file in [
+            ("moge.utils.tools", "tools.py"),
+            ("moge.utils.geometry_numpy", "geometry_numpy.py"),
+            ("moge.utils.geometry_torch", "geometry_torch.py"),
+        ]:
+            _fpath = _moge_utils_dir / _mod_file
+            if _fpath.exists() and _mod_name not in sys.modules:
+                _spec = _ilu.spec_from_file_location(
+                    _mod_name, str(_fpath),
+                    submodule_search_locations=[],
+                )
+                _real_mod = _ilu.module_from_spec(_spec)
+                _real_mod.__package__ = "moge.utils"
+                sys.modules[_mod_name] = _real_mod
+                try:
+                    _spec.loader.exec_module(_real_mod)
+                except Exception:
+                    del sys.modules[_mod_name]
 
     # gsplat — CUDA-only Gaussian splatting renderer ─────────────────
     _ensure_mock("gsplat", {"rasterization": _noop})
@@ -767,34 +817,33 @@ def load_real_moge_cpu(pretrained_model_name_or_path: str = "Ruicheng/moge-vitl"
         The real MoGe model (``MoGeModel``), ready for ``model.infer(image)``.
     """
     import importlib
+    import sys as _sys
 
     # Temporarily patch CUDA availability so MoGe loads on CPU
     _orig_cuda_avail = torch.cuda.is_available
     torch.cuda.is_available = lambda: False
 
     try:
-        # The mock may have replaced moge.model.v1 — try importing the real one
-        # If the real moge package is installed, importlib.reload will restore it
+        # Remove ALL moge modules from sys.modules so real ones can load.
+        # We must remove every cached entry — not just those that look like
+        # mocks — because partial real/mock mixtures break the import chain.
+        _saved_moge_mods = {}
+        for key in list(_sys.modules.keys()):
+            if key == "moge" or key.startswith("moge."):
+                _saved_moge_mods[key] = _sys.modules.pop(key)
+
         try:
             import moge.model.v1 as _moge_v1
-            # Check if this is the mock
-            if hasattr(_moge_v1.MoGeModel, "_dummy"):
-                raise AttributeError("Mock detected — need real module")
+            importlib.reload(_moge_v1)  # force fresh load
             MoGeModel = _moge_v1.MoGeModel
-        except (ImportError, AttributeError):
-            # Try reloading from the real package
-            try:
-                import moge.model.v1 as _moge_v1
-                importlib.reload(_moge_v1)
-                MoGeModel = _moge_v1.MoGeModel
-                # Still mock? Give up.
-                if hasattr(MoGeModel, "_dummy"):
-                    raise ImportError("Could not load real MoGe — mock persists")
-            except Exception:
-                raise ImportError(
-                    "Cannot load real MoGe model. Please install moge: "
-                    "pip install moge"
-                )
+            # Verify we got the real class — the real module has a __file__
+            if not hasattr(_moge_v1, "__file__") or _moge_v1.__file__ is None:
+                raise ImportError("Still got mock module after removing from sys.modules")
+        except (ImportError, AttributeError) as e:
+            raise ImportError(
+                f"Cannot load real MoGe model ({e}). Please install moge: "
+                "pip install MoGe@git+https://github.com/microsoft/MoGe.git"
+            )
 
         print(f"[OV-SAM3D] Loading real MoGe model from {pretrained_model_name_or_path} …")
         model = MoGeModel.from_pretrained(pretrained_model_name_or_path)
@@ -803,6 +852,9 @@ def load_real_moge_cpu(pretrained_model_name_or_path: str = "Ruicheng/moge-vitl"
         return model
     finally:
         torch.cuda.is_available = _orig_cuda_avail
+        # Restore saved moge modules (force overwrite) so mock stays active
+        # for the rest of the pipeline code that expects the mock
+        _sys.modules.update(_saved_moge_mods)
 
 
 def patch_pipeline_config(config):
@@ -1805,25 +1857,122 @@ class MoGeForOV(nn.Module):
     """
     Wraps the MoGe depth-estimation model for OV conversion.
 
-    The underlying model is a ViT — directly convertible.
+    Extracts the backbone + head computation into a clean forward path
+    that returns ``(points, mask)`` tensors (no dict, no torch.autocast).
+
+    The caller (OVMoGe) is responsible for:
+      - resizing the input image to the num_tokens-determined resolution
+      - post-processing (recover_focal_shift, mask application)
     """
 
     def __init__(self, moge_model):
         super().__init__()
-        self.model = moge_model
+        self.backbone = moge_model.backbone
+        self.head = moge_model.head
+        # Copy registered buffers
+        self.image_mean = moge_model.image_mean
+        self.image_std = moge_model.image_std
+        self._intermediate_layers = moge_model.intermediate_layers
+        # Store remap config
+        self.remap_output = getattr(moge_model, "remap_output", "linear")
+
+    def _remap_points(self, points: torch.Tensor) -> torch.Tensor:
+        """Apply nonlinear remapping matching MoGeModel._remap_points."""
+        if self.remap_output == "linear":
+            pass
+        elif self.remap_output == "sinh":
+            points = torch.sinh(points)
+        elif self.remap_output == "exp":
+            xy, z = points.split([2, 1], dim=-1)
+            z = torch.exp(z)
+            points = torch.cat([xy * z, z], dim=-1)
+        elif self.remap_output == "sinh_exp":
+            xy, z = points.split([2, 1], dim=-1)
+            points = torch.cat([torch.sinh(xy), torch.exp(z)], dim=-1)
+        return points
 
     @torch.no_grad()
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
-        image : (B, 3, H, W)  float32 in [0, 1]
+        image : (1, 3, H, W)  float32 in [0, 1], already resized to target
+                resolution (num_tokens-based).
 
         Returns
         -------
-        points : (B, H, W, 3)  predicted 3-D point-map
+        points : (1, H, W, 3)  predicted 3-D point-map after _remap_points
+        mask   : (1, H, W)     confidence mask (logits, not sigmoid)
         """
-        return self.model(image)
+        original_height, original_width = image.shape[-2:]
+
+        # Normalize for DINOv2
+        image_norm = (image - self.image_mean) / self.image_std
+        # Pad to 14-divisible
+        H14 = (original_height // 14) * 14
+        W14 = (original_width // 14) * 14
+        image_14 = F.interpolate(
+            image_norm, (H14, W14), mode="bilinear",
+            align_corners=False, antialias=True,
+        )
+
+        # Get backbone features
+        features = self.backbone.get_intermediate_layers(
+            image_14, self._intermediate_layers, return_class_token=True,
+        )
+
+        # Head prediction — head receives the normalized (non-14-padded) image
+        points, mask = self.head(features, image_norm)
+
+        # Resize to input resolution
+        points = F.interpolate(
+            points, (original_height, original_width),
+            mode="bilinear", align_corners=False, antialias=False,
+        )
+        mask = F.interpolate(
+            mask, (original_height, original_width),
+            mode="bilinear", align_corners=False, antialias=False,
+        )
+        points = points.permute(0, 2, 3, 1)  # (1, H, W, 3)
+        mask = mask.squeeze(1)                 # (1, H, W)
+
+        # Apply nonlinear remapping (critical for 'exp' mode)
+        points = self._remap_points(points)
+
+        return points, mask
+
+
+class PointProjForOV(nn.Module):
+    """
+    Wraps the PointPatchEmbed outer-path learnable ops for OV conversion.
+
+    Converts ``point_proj`` (nn.Linear) and ``invalid_xyz_token``
+    application into a single OV model.
+
+    Input:  (B, H, W, 3)  — remapped XYZ coordinates
+            (B, H, W)     — valid_mask (True = valid point)
+    Output: (B, H, W, embed_dim)  — projected point embeddings
+    """
+
+    def __init__(self, ppe_model):
+        super().__init__()
+        self.point_proj = ppe_model.point_proj
+        self.invalid_xyz_token = ppe_model.invalid_xyz_token
+
+    @torch.no_grad()
+    def forward(
+        self,
+        xyz_remapped: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.point_proj(xyz_remapped)            # (B, H, W, D)
+        inv_mask = ~valid_mask.bool()
+        x = torch.where(
+            inv_mask.unsqueeze(-1),
+            self.invalid_xyz_token.expand_as(x),
+            x,
+        )
+        return x
 
 
 class EmbedderProjectionForOV(nn.Module):
@@ -2213,9 +2362,13 @@ def convert_slat_decoder_mesh_merged(
 def convert_moge(
     moge_model,
     output_path: Union[str, Path],
-    input_shape: Tuple[int, ...] = (1, 3, 512, 512),
+    input_shape: Tuple[int, ...] = (1, 3, 700, 700),
 ) -> ov.Model:
-    """Convert the MoGe depth model to OpenVINO IR."""
+    """Convert the MoGe depth model to OpenVINO IR.
+
+    Default input_shape (1,3,700,700) corresponds to ~2500 DINOv2 tokens
+    (50×50 patches of 14×14), matching resolution_level=9.
+    """
     output_path = Path(output_path)
     if output_path.exists():
         print(f"[OV-SAM3D] Skipping {output_path} — already exists")
@@ -2227,6 +2380,55 @@ def convert_moge(
         ov_model = ov.convert_model(wrapper, example_input=example)
     ov.save_model(ov_model, str(output_path))
     print(f"[OV-SAM3D] Saved MoGe depth model → {output_path}")
+
+    # Save non-learnable config for runtime
+    import json as _json
+    config = {
+        "traced_h": input_shape[2],
+        "traced_w": input_shape[3],
+        "remap_output": wrapper.remap_output,
+        "mask_threshold": float(getattr(moge_model, "mask_threshold", 0.5)),
+        "num_tokens_range": list(getattr(moge_model, "num_tokens_range", [1275, 2551])),
+    }
+    config_path = output_path.parent / "moge_config.json"
+    with open(config_path, "w") as f:
+        _json.dump(config, f, indent=2)
+    print(f"[OV-SAM3D] Saved MoGe config → {config_path}")
+
+    del wrapper
+    _cleanup()
+    return ov_model
+
+
+def convert_point_proj(
+    ppe_model,
+    output_path: Union[str, Path],
+    input_size: int = None,
+) -> ov.Model:
+    """Convert the PointPatchEmbed outer-path learnable ops to OpenVINO IR.
+
+    Converts ``point_proj`` (nn.Linear) + ``invalid_xyz_token`` application
+    into a single OV model.
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        print(f"[OV-SAM3D] Skipping {output_path} — already exists")
+        return ov.Core().read_model(str(output_path))
+
+    if input_size is None:
+        input_size = ppe_model.input_size if hasattr(ppe_model, "input_size") else 256
+
+    wrapper = PointProjForOV(ppe_model).eval().float()
+    H = W = input_size
+    example_xyz = torch.randn(1, H, W, 3, dtype=torch.float32)
+    example_mask = torch.ones(1, H, W, dtype=torch.bool)
+
+    with torch.no_grad():
+        ov_model = ov.convert_model(
+            wrapper, example_input=(example_xyz, example_mask),
+        )
+    ov.save_model(ov_model, str(output_path))
+    print(f"[OV-SAM3D] Saved PointProj → {output_path}")
     del wrapper
     _cleanup()
     return ov_model
@@ -2459,10 +2661,26 @@ def convert_all_models(
             compiled["mesh_decoder_upsample_ov"] = core.compile_model(ov_m, device)
 
     # ── MoGe depth model ──────────────────────────────────────────────
-    # MoGe is kept as a PyTorch model on CPU (not converted to OV).
-    # The mock MoGe from patch_cuda_for_cpu() has no real weights;
-    # the real model is loaded later in _patch_moge() during pipeline setup.
-    print("[OV-SAM3D] Skipping MoGe OV conversion — will use PyTorch on CPU")
+    # Convert MoGe to OV.  The mock from patch_cuda_for_cpu() has no real
+    # weights, so we load the real model first.
+    print("[OV-SAM3D] Converting MoGe depth model …")
+    try:
+        real_moge = load_real_moge_cpu()
+        ov_m = convert_moge(real_moge, output_dir / "moge_depth.xml")
+        compiled["moge_depth_ov"] = core.compile_model(ov_m, device)
+        del real_moge
+        _cleanup()
+    except Exception as e:
+        print(f"[OV-SAM3D] WARNING: MoGe OV conversion failed ({e}), "
+              "will fall back to PyTorch on CPU")
+
+    # ── PointPatchEmbed outer-path point_proj (nn.Linear) ─────────────
+    if len(ss_embedder.embedder_list) > 2:
+        ppe = ss_embedder.embedder_list[2][0]
+        if hasattr(ppe, "point_proj"):
+            print("[OV-SAM3D] Converting PointPatchEmbed point_proj …")
+            ov_m = convert_point_proj(ppe, output_dir / "point_proj.xml")
+            compiled["point_proj_ov"] = core.compile_model(ov_m, device)
 
     # ── EmbedderFuser idx_emb (learned positional embeddings) ─────────
     # These nn.Parameters live in EmbedderFuser and are added to condition
@@ -2509,19 +2727,18 @@ def convert_all_models(
 
 
 def _save_pipeline_sidecar(pipeline, output_dir: Path):
-    """Save small pipeline components needed to create OV pipeline without the original.
+    """Save lightweight pipeline metadata needed to create OV pipeline.
 
-    Saved data (~5-10 MB total):
-      - Generator backbone condition_embedder state dicts (small MLPs)
-      - Backbone metadata (force_zeros_cond, latent_share_transformer, etc.)
-      - Config path for recreating the pipeline skeleton
+    All learnable weights are in OV models.  This JSON sidecar stores only:
+      - Generator backbone metadata (force_zeros_cond, latent_share_transformer)
+      - Latent mapping shapes (pos_emb sizes for noise generation)
     """
     import json as _json
 
     output_dir = Path(output_dir)
-    sidecar = {}
+    sidecar: Dict[str, Any] = {}
 
-    # ── Generator backbone condition embedders + metadata ──
+    # ── Generator backbone metadata + latent_mapping shapes ──
     for gen_name in ["ss_generator", "slat_generator"]:
         gen = _moduledict_get(pipeline.models, gen_name)
         if gen is None:
@@ -2530,15 +2747,10 @@ def _save_pipeline_sidecar(pipeline, output_dir: Path):
         if backbone is None:
             continue
 
-        prefix = gen_name  # "ss_generator" or "slat_generator"
+        prefix = gen_name
 
-        # Save condition_embedder state dict (small MLP, ~1-5 MB)
-        cond_emb = getattr(backbone, "condition_embedder", None)
-        if cond_emb is not None and isinstance(cond_emb, nn.Module):
-            sidecar[f"{prefix}_cond_emb"] = cond_emb.state_dict()
-
-        # Save metadata
-        meta = {}
+        # Save metadata (no learnable weights — just config)
+        meta: Dict[str, Any] = {}
         if hasattr(backbone, "force_zeros_cond"):
             meta["force_zeros_cond"] = bool(backbone.force_zeros_cond)
         if hasattr(backbone, "latent_share_transformer"):
@@ -2546,43 +2758,30 @@ def _save_pipeline_sidecar(pipeline, output_dir: Path):
                 meta["latent_share_transformer"] = {
                     str(k): list(v) if not isinstance(v, list) else v
                 }
-                break  # only first entry needed (pose latent names)
+                break
         sidecar[f"{prefix}_meta"] = meta
 
-        # Save latent_mapping state dict (pos_emb + projection layers)
-        # Needed so the skeleton has correct token counts for noise generation
+        # Save latent_mapping shapes only (weights are in OV models)
         if hasattr(backbone, "latent_mapping"):
-            sidecar[f"{prefix}_latent_mapping"] = {
-                k: v.clone() for k, v in backbone.latent_mapping.state_dict().items()
-            }
+            lm_shapes: Dict[str, Any] = {}
+            for entry_name in backbone.latent_mapping:
+                entry = backbone.latent_mapping[entry_name]
+                entry_info: Dict[str, Any] = {}
+                if hasattr(entry, "pos_emb"):
+                    entry_info["pos_emb_shape"] = list(entry.pos_emb.shape)
+                if hasattr(entry, "input_layer"):
+                    entry_info["input_in_features"] = entry.input_layer.in_features
+                    entry_info["input_out_features"] = entry.input_layer.out_features
+                if hasattr(entry, "output_layer"):
+                    entry_info["output_in_features"] = entry.output_layer.in_features
+                    entry_info["output_out_features"] = entry.output_layer.out_features
+                lm_shapes[entry_name] = entry_info
+            sidecar[f"{prefix}_latent_mapping_shapes"] = lm_shapes
 
-    # ── For core-only SLat mode: save backbone I/O block weights ──
-    slat_gen = _moduledict_get(pipeline.models, "slat_generator")
-    if slat_gen is not None:
-        slat_bb = _unwrap_to_backbone(slat_gen)
-        if slat_bb is not None:
-            io_state = {}
-            for name, param in slat_bb.named_parameters():
-                top = name.split(".")[0]
-                # Keep: input_layer, t_embedder, d_embedder, adaLN_modulation,
-                #        input_blocks, out_blocks, out_layer, pos_embedder
-                # Skip: blocks (core transformer, in OV)
-                if top != "blocks":
-                    io_state[name] = param.data.clone()
-            sidecar["slat_backbone_io"] = io_state
-
-    # ── For non-merged mesh decoder fallback: save upsample block weights ──
-    mesh_dec = _moduledict_get(pipeline.models, "slat_decoder_mesh")
-    if mesh_dec is not None and hasattr(mesh_dec, "upsample"):
-        up_state = {}
-        for name, param in mesh_dec.named_parameters():
-            top = name.split(".")[0]
-            if top in ("upsample", "out_layer"):
-                up_state[name] = param.data.clone()
-        sidecar["mesh_decoder_upsample_state"] = up_state
-
-    torch.save(sidecar, output_dir / "pipeline_sidecar.pt")
-    print(f"[OV-SAM3D] Saved pipeline sidecar data to {output_dir / 'pipeline_sidecar.pt'}")
+    sidecar_path = output_dir / "pipeline_sidecar.json"
+    with open(sidecar_path, "w") as f:
+        _json.dump(sidecar, f, indent=2)
+    print(f"[OV-SAM3D] Saved pipeline sidecar metadata to {sidecar_path}")
 
 
 # ============================================================================
@@ -2844,16 +3043,149 @@ class OVMoGe:
     """
     Replaces the MoGe depth model with an OV model.
 
-    ``(image) → output``
+    Replicates the full ``MoGeModel.infer()`` pipeline:
+      1. Resize input image to num_tokens-determined resolution
+      2. Call OV model (normalization + backbone + head + _remap_points)
+      3. Resize output back to original resolution
+      4. Apply recover_focal_shift + z-shift + mask
+
+    Returns the same dict as ``MoGe(DepthModel).__call__``:
+      ``{"pointmaps": (H, W, 3), "intrinsics": (3, 3), "mask": (H, W)}``
     """
 
-    def __init__(self, compiled_model: ov.CompiledModel):
+    def __init__(self, compiled_model: ov.CompiledModel, config: dict = None):
+        self.compiled_model = compiled_model
+        self._infer_request = compiled_model.create_infer_request()
+        if config is None:
+            config = {}
+        self.traced_h = config.get("traced_h", 700)
+        self.traced_w = config.get("traced_w", 700)
+        self.mask_threshold = config.get("mask_threshold", 0.5)
+        self.num_tokens_range = config.get("num_tokens_range", [1275, 2551])
+
+    def __call__(
+        self,
+        image: torch.Tensor,
+        resolution_level: int = 9,
+        force_projection: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        image : (B, 3, H, W) or (3, H, W)  float32 in [0, 1]
+        resolution_level : int  [0-9], controls DINOv2 token count.
+        force_projection : bool  if True, recompute pointmap from depth.
+
+        Returns
+        -------
+        dict with keys: pointmaps, intrinsics, depth, mask, mask_prob
+        """
+        if image.dim() == 3:
+            omit_batch = True
+            image = image.unsqueeze(0)
+        else:
+            omit_batch = False
+
+        _, _, orig_h, orig_w = image.shape
+
+        # Resize to traced resolution (matches num_tokens at trace time)
+        if orig_h != self.traced_h or orig_w != self.traced_w:
+            image_resized = F.interpolate(
+                image.float(), (self.traced_h, self.traced_w),
+                mode="bilinear", align_corners=False,
+            )
+        else:
+            image_resized = image.float()
+
+        # Run OV model → (points, mask)
+        image_np = image_resized.detach().cpu().numpy()
+        self._infer_request.infer(image_np)
+        points_np = self._infer_request.get_output_tensor(0).data
+        mask_np = self._infer_request.get_output_tensor(1).data
+        points = torch.from_numpy(points_np.copy())  # (B, H_t, W_t, 3)
+        mask = torch.from_numpy(mask_np.copy())       # (B, H_t, W_t)
+
+        # Resize back to original spatial dims
+        if orig_h != self.traced_h or orig_w != self.traced_w:
+            points = points.permute(0, 3, 1, 2)  # (B, 3, H_t, W_t)
+            points = F.interpolate(
+                points, (orig_h, orig_w),
+                mode="bilinear", align_corners=False,
+            )
+            points = points.permute(0, 2, 3, 1)  # (B, H, W, 3)
+            mask = F.interpolate(
+                mask.unsqueeze(1), (orig_h, orig_w),
+                mode="bilinear", align_corners=False,
+            ).squeeze(1)
+
+        mask_binary = mask > self.mask_threshold
+
+        # Post-processing: recover_focal_shift + depth (matches MoGeModel.infer)
+        try:
+            from moge.utils.geometry_torch import recover_focal_shift
+            import utils3d.torch as u3d
+
+            aspect_ratio = orig_w / orig_h
+            focal, shift = recover_focal_shift(points, mask_binary)
+            fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
+            fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+            intrinsics = u3d.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
+            depth = points[..., 2] + shift[..., None, None]
+
+            if force_projection:
+                points = u3d.depth_to_points(depth, intrinsics=intrinsics)
+            else:
+                points = points + torch.stack(
+                    [torch.zeros_like(shift), torch.zeros_like(shift), shift],
+                    dim=-1,
+                )[..., None, None, :]
+
+            # Apply mask
+            points = torch.where(mask_binary[..., None], points, torch.tensor(float("inf")))
+            depth = torch.where(mask_binary, depth, torch.tensor(float("inf")))
+        except Exception as _e:
+            print(f"[OV-SAM3D] WARNING: MoGe post-processing failed ({_e}), "
+                  "returning raw points")
+            focal_fallback = float(max(orig_h, orig_w))
+            intrinsics = torch.tensor([
+                [focal_fallback, 0.0, orig_w / 2.0],
+                [0.0, focal_fallback, orig_h / 2.0],
+                [0.0, 0.0, 1.0],
+            ], dtype=torch.float32).unsqueeze(0)
+            depth = points[..., 2]
+
+        if omit_batch:
+            points = points.squeeze(0)
+            intrinsics = intrinsics.squeeze(0)
+            depth = depth.squeeze(0)
+            mask_binary = mask_binary.squeeze(0)
+            mask = mask.squeeze(0)
+
+        return {
+            "pointmaps": points,
+            "points": points,
+            "intrinsics": intrinsics,
+            "depth": depth,
+            "mask": mask_binary,
+            "mask_prob": torch.sigmoid(mask),
+        }
+
+
+class OVPointProj:
+    """
+    Replaces the PointPatchEmbed outer-path learnable ops with an OV model.
+
+    ``(xyz_remapped, valid_mask) → projected embeddings``
+    """
+
+    def __init__(self, compiled_model):
         self.compiled_model = compiled_model
         self._infer_request = compiled_model.create_infer_request()
 
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        image_np = image.float().detach().cpu().numpy()
-        self._infer_request.infer(image_np)
+    def __call__(self, xyz_remapped: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        xyz_np = xyz_remapped.float().detach().cpu().numpy()
+        mask_np = valid_mask.detach().cpu().numpy()
+        self._infer_request.infer([xyz_np, mask_np])
         out_np = self._infer_request.get_output_tensor(0).data
         return torch.from_numpy(out_np.copy())
 
@@ -2936,6 +3268,10 @@ class _OVPipelineMixin:
         self._patch_slat_decoders()
         self._patch_moge()
         self._patch_autocast()
+        # Ensure all modules are in eval mode — in training mode, PyTorch
+        # CFG wrappers skip guidance blending and only call backbone once,
+        # which drastically degrades quality.
+        self.models.eval()
         self._free_replaced_parameters()
 
     # ------------------------------------------------------------------
@@ -2991,30 +3327,82 @@ class _OVPipelineMixin:
         print("[OV-SAM3D] Lightweight pipeline created from config (no heavy weights loaded)")
 
     def _restore_sidecar_weights(self, ov_model_dir):
-        """Load small component weights saved by _save_pipeline_sidecar()."""
-        sidecar_path = Path(ov_model_dir) / "pipeline_sidecar.pt"
+        """Load pipeline metadata from JSON sidecar (no .pt files).
+
+        All learnable weights are in OV models.  This only restores:
+          - Generator backbone metadata (force_zeros_cond, latent_share_transformer)
+          - Latent mapping shapes (pos_emb sizes for noise generation)
+        """
+        import json as _json
+
+        sidecar_path = Path(ov_model_dir) / "pipeline_sidecar.json"
         if not sidecar_path.exists():
+            # Try legacy .pt file for backward compatibility
+            legacy_path = Path(ov_model_dir) / "pipeline_sidecar.pt"
+            if legacy_path.exists():
+                print(f"[OV-SAM3D] WARNING: Found legacy {legacy_path}, "
+                      "please re-run convert_all_models to generate JSON sidecar")
+                self._restore_sidecar_weights_legacy(legacy_path)
+                return
             print(f"[OV-SAM3D] WARNING: {sidecar_path} not found, "
-                  "skipping sidecar weight restoration")
+                  "skipping sidecar restoration")
             return
 
+        with open(sidecar_path, "r") as f:
+            sidecar = _json.load(f)
+
+        # Restore generator backbone metadata
+        for gen_name in ["ss_generator", "slat_generator"]:
+            meta_key = f"{gen_name}_meta"
+            if meta_key not in sidecar:
+                continue
+            meta = sidecar[meta_key]
+            gen = _moduledict_get(self.models, gen_name)
+            if gen is None:
+                continue
+            backbone = _unwrap_to_backbone(gen)
+            if backbone is None:
+                continue
+            if "force_zeros_cond" in meta:
+                backbone.force_zeros_cond = meta["force_zeros_cond"]
+            if "latent_share_transformer" in meta:
+                # Rebuild the dict structure
+                for merged_key, names in meta["latent_share_transformer"].items():
+                    backbone.latent_share_transformer = {merged_key: names}
+                    break
+
+        # Restore latent_mapping shapes (create dummy tensors with correct sizes)
+        for gen_name in ["ss_generator", "slat_generator"]:
+            shapes_key = f"{gen_name}_latent_mapping_shapes"
+            if shapes_key not in sidecar:
+                continue
+            gen = _moduledict_get(self.models, gen_name)
+            if gen is None:
+                continue
+            backbone = _unwrap_to_backbone(gen)
+            if backbone is None or not hasattr(backbone, "latent_mapping"):
+                continue
+            lm_shapes = sidecar[shapes_key]
+            for entry_name, entry_info in lm_shapes.items():
+                if entry_name not in backbone.latent_mapping:
+                    continue
+                entry = backbone.latent_mapping[entry_name]
+                # Fix pos_emb shape (skeleton may have empty/wrong shape)
+                if "pos_emb_shape" in entry_info and hasattr(entry, "pos_emb"):
+                    target_shape = entry_info["pos_emb_shape"]
+                    if list(entry.pos_emb.shape) != target_shape:
+                        dummy = torch.zeros(target_shape, dtype=entry.pos_emb.dtype)
+                        if isinstance(entry.pos_emb, nn.Parameter):
+                            entry.pos_emb = nn.Parameter(dummy, requires_grad=False)
+                        else:
+                            entry.pos_emb = dummy
+
+        print(f"[OV-SAM3D] Restored pipeline metadata from {sidecar_path}")
+
+    def _restore_sidecar_weights_legacy(self, sidecar_path):
+        """Backward-compatible loader for legacy .pt sidecar files."""
         sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=False)
 
-        # Restore generator backbone condition_embedders
-        for gen_name in ["ss_generator", "slat_generator"]:
-            cond_key = f"{gen_name}_cond_emb"
-            if cond_key in sidecar:
-                gen = _moduledict_get(self.models, gen_name)
-                if gen is not None:
-                    backbone = _unwrap_to_backbone(gen)
-                    cond_emb = getattr(backbone, "condition_embedder", None) if backbone else None
-                    if cond_emb is not None and isinstance(cond_emb, nn.Module):
-                        cond_emb.load_state_dict(
-                            sidecar[cond_key], strict=False
-                        )
-
-        # Restore SS generator latent_mapping (pos_emb + projection layers)
-        # Skeleton model has empty pos_emb for pose entries; we need correct shapes
         for gen_name in ["ss_generator", "slat_generator"]:
             lm_key = f"{gen_name}_latent_mapping"
             if lm_key not in sidecar:
@@ -3026,10 +3414,8 @@ class _OVPipelineMixin:
             if backbone is None or not hasattr(backbone, "latent_mapping"):
                 continue
             saved_lm = sidecar[lm_key]
-            # Manual assignment handles shape mismatches (e.g. pos_emb [0] → [1, 1024])
             for param_name, saved_tensor in saved_lm.items():
                 parts = param_name.split(".")
-                # Navigate to the parameter's parent module
                 mod = backbone.latent_mapping
                 for part in parts[:-1]:
                     mod = getattr(mod, part)
@@ -3040,30 +3426,7 @@ class _OVPipelineMixin:
                 elif old is not None and isinstance(old, torch.Tensor):
                     setattr(mod, attr, saved_tensor)
 
-        # Restore SLat backbone I/O block weights (for core-only mode)
-        if "slat_backbone_io" in sidecar:
-            slat_gen = _moduledict_get(self.models, "slat_generator")
-            if slat_gen is not None:
-                slat_bb = _unwrap_to_backbone(slat_gen)
-                if slat_bb is not None:
-                    # Load only matching keys
-                    bb_state = slat_bb.state_dict()
-                    for k, v in sidecar["slat_backbone_io"].items():
-                        if k in bb_state and bb_state[k].shape == v.shape:
-                            bb_state[k] = v
-                    slat_bb.load_state_dict(bb_state, strict=False)
-
-        # Restore mesh decoder upsample weights (for non-merged fallback)
-        if "mesh_decoder_upsample_state" in sidecar:
-            mesh_dec = _moduledict_get(self.models, "slat_decoder_mesh")
-            if mesh_dec is not None:
-                dec_state = mesh_dec.state_dict()
-                for k, v in sidecar["mesh_decoder_upsample_state"].items():
-                    if k in dec_state and dec_state[k].shape == v.shape:
-                        dec_state[k] = v
-                mesh_dec.load_state_dict(dec_state, strict=False)
-
-        print(f"[OV-SAM3D] Restored sidecar weights from {sidecar_path}")
+        print(f"[OV-SAM3D] Restored legacy sidecar weights from {sidecar_path}")
 
     def _free_replaced_parameters(self):
         """Free PyTorch parameters that have been replaced by OV compiled models."""
@@ -3201,24 +3564,22 @@ class _OVPipelineMixin:
                     )
             print(f"[OV-SAM3D] Loaded EmbedderFuser idx_emb from {_ef_cfg_path}")
 
-        # Patch PointPatchEmbed inner attention (SS embedder only)
-        if "pointpatch_embed_inner_ov" in self._compiled:
-            if len(ss_emb.embedder_list) > 2:
-                ppe = ss_emb.embedder_list[2][0]
-                ov_inner = OVPointPatchEmbedInner(
-                    self._compiled["pointpatch_embed_inner_ov"]
-                )
+        # Patch PointPatchEmbed (SS embedder only)
+        if len(ss_emb.embedder_list) > 2:
+            ppe = ss_emb.embedder_list[2][0]
 
-                # Load outer-path weights from sidecar JSON if available
+            # ── point_proj OV model (replaces nn.Linear + invalid_xyz_token) ──
+            ov_point_proj = None
+            if "point_proj_ov" in self._compiled:
+                ov_point_proj = OVPointProj(self._compiled["point_proj_ov"])
+                print("[OV-SAM3D] PointPatchEmbed point_proj → OV")
+            else:
+                # Fallback: load outer-path weights from JSON into PyTorch
                 config_path = self._ov_model_dir / "pointpatch_config.json"
-                if not config_path.exists():
-                    config_path = None
-
-                if config_path is not None:
+                if config_path.exists():
                     import json as _json
                     with open(config_path, "r") as _f:
                         _outer = _json.load(_f)
-                    # Restore outer-path weights onto the PointPatchEmbed module
                     if "point_proj_weight" in _outer:
                         ppe.point_proj.weight.data = torch.tensor(
                             _outer["point_proj_weight"], dtype=torch.float32
@@ -3237,16 +3598,56 @@ class _OVPipelineMixin:
                         )
                     print(f"[OV-SAM3D] Loaded PointPatchEmbed outer weights from {config_path}")
 
-                # Monkey-patch: replace inner_forward with OV call
-                _orig_embed_windows = ppe.embed_pointmap_windows
+            # Load non-learnable config (remap_type, etc.) from pointpatch_config.json
+            config_path = self._ov_model_dir / "pointpatch_config.json"
+            if config_path.exists():
+                import json as _json
+                with open(config_path, "r") as _f:
+                    _outer = _json.load(_f)
+                if "dropped_xyz_token" in _outer and hasattr(ppe, "dropped_xyz_token"):
+                    ppe.dropped_xyz_token.data = torch.tensor(
+                        _outer["dropped_xyz_token"], dtype=torch.float32
+                    )
 
-                def _ov_ppe_forward(xyz, valid_mask=None, _embed_fn=_orig_embed_windows, _ov=ov_inner):
-                    x, B, H, W = _embed_fn(xyz, valid_mask)
+            # ── inner attention OV model ──
+            ov_inner = None
+            if "pointpatch_embed_inner_ov" in self._compiled:
+                ov_inner = OVPointPatchEmbedInner(
+                    self._compiled["pointpatch_embed_inner_ov"]
+                )
+
+            # Monkey-patch the forward
+            _ov_pp = ov_point_proj
+            _ov_in = ov_inner
+
+            def _ov_ppe_forward(xyz, valid_mask=None, _ppe=ppe, _ov_proj=_ov_pp, _ov_inner=_ov_in):
+                with torch.no_grad():
+                    xyz_safe = _ppe.resize_input(xyz)
+                    if valid_mask is None:
+                        valid_mask = xyz_safe.isfinite().all(dim=-1)
+                    B, H, W, _ = xyz_safe.shape
+                    xyz_safe_clean = xyz_safe.clone()
+                    xyz_safe_clean[~valid_mask] = 0.0
+                    xyz_remapped = _ppe.point_remapper(xyz_safe_clean)
+
+                if _ov_proj is not None:
+                    # OV point_proj: handles projection + invalid token
+                    x = _ov_proj(xyz_remapped, valid_mask.float())
+                else:
+                    # PyTorch fallback
+                    x = _ppe.point_proj(xyz_remapped)
+                    x[~valid_mask] = 0.0
+                    x[~valid_mask] += _ppe.invalid_xyz_token
+
+                if _ov_inner is not None:
                     n_h = torch.tensor(H, dtype=torch.int64)
                     n_w = torch.tensor(W, dtype=torch.int64)
-                    return _ov(x, n_h, n_w)
+                    return _ov_inner(x, n_h, n_w)
+                else:
+                    return _ppe.inner_forward(x, B, H, W)
 
-                ppe.forward = _ov_ppe_forward
+            ppe.forward = _ov_ppe_forward
+            if ov_inner is not None:
                 print("[OV-SAM3D] PointPatchEmbed inner attention → OV")
 
         print("[OV-SAM3D] DINOv2 embedders replaced with OV wrappers (merged backbone)")
@@ -3351,13 +3752,29 @@ class _OVPipelineMixin:
         orig_cond_emb = backbone.condition_embedder
         force_zeros = backbone.force_zeros_cond
 
+        # Cache for condition embeddings (inputs never change across ODE steps)
+        _ss_cond_cache = {"cond": None, "args_id": None}
+
         def _ov_forward(latents_dict, t, *cond_args, **cond_kwargs):
             d = cond_kwargs.pop("d", None)
             cfg_activate = cond_kwargs.pop("cfg", False)
+
             if force_zeros and cfg_activate:
-                cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
+                # CFG uncond branch — zeros
+                if _ss_cond_cache["cond"] is not None:
+                    cond = torch.zeros_like(_ss_cond_cache["cond"])
+                else:
+                    cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
             else:
-                cond = orig_cond_emb(*cond_args, **cond_kwargs)
+                # Check cache: condition inputs are identical across ODE steps
+                args_id = id(cond_args[0]) if cond_args else None
+                if _ss_cond_cache["cond"] is not None and _ss_cond_cache["args_id"] == args_id:
+                    cond = _ss_cond_cache["cond"]
+                else:
+                    cond = orig_cond_emb(*cond_args, **cond_kwargs)
+                    _ss_cond_cache["cond"] = cond
+                    _ss_cond_cache["args_id"] = args_id
+
             if d is None:
                 d = torch.zeros_like(t)
             shape_latent = latents_dict["shape"]
@@ -3393,6 +3810,9 @@ class _OVPipelineMixin:
             orig_cond_emb = backbone.condition_embedder
             force_zeros = backbone.force_zeros_cond
 
+            # Cache for condition embeddings (inputs never change across ODE steps)
+            _slat_cond_cache = {"cond": None, "args_id": None}
+
             def _ov_forward_full(x, t, *cond_args, **cond_kwargs):
                 d = cond_kwargs.pop("d", None)
                 if not torch.compiler.is_compiling():
@@ -3411,11 +3831,20 @@ class _OVPipelineMixin:
                     else coords_raw
                 )
 
-                # Condition embedding
+                # Condition embedding with caching
                 if force_zeros and cfg_activate:
-                    cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
+                    if _slat_cond_cache["cond"] is not None:
+                        cond = torch.zeros_like(_slat_cond_cache["cond"])
+                    else:
+                        cond = orig_cond_emb(*cond_args, **cond_kwargs) * 0
                 else:
-                    cond = orig_cond_emb(*cond_args, **cond_kwargs)
+                    args_id = id(cond_args[0]) if cond_args else None
+                    if _slat_cond_cache["cond"] is not None and _slat_cond_cache["args_id"] == args_id:
+                        cond = _slat_cond_cache["cond"]
+                    else:
+                        cond = orig_cond_emb(*cond_args, **cond_kwargs)
+                        _slat_cond_cache["cond"] = cond
+                        _slat_cond_cache["args_id"] = args_id
 
                 # Full backbone → single OV call
                 feats = x[0]                         # (N, C_in)
@@ -3649,30 +4078,49 @@ class _OVPipelineMixin:
             print(f"[OV-SAM3D] {orig_key} decoder → OV")
 
     def _patch_moge(self):
-        """Load real MoGe model on CPU and integrate into compute_pointmap.
+        """Replace MoGe depth model with OV model or fall back to PyTorch.
 
-        The mock MoGe installed by ``patch_cuda_for_cpu()`` generates synthetic
-        depth data.  This method replaces it with the real MoGe model running
-        on CPU via PyTorch (not converted to OV — per user decision).
+        Prefers OV model (``moge_depth_ov``) if available from conversion.
+        Falls back to real PyTorch model on CPU if OV model is not available.
         """
         _pipeline = self
 
-        try:
-            real_moge = load_real_moge_cpu()
-        except Exception as e:
-            print(
-                f"[OV-SAM3D] WARNING: Could not load real MoGe model ({e}). "
-                "Falling back to synthetic pointmap data."
-            )
-            return
+        # Determine which MoGe backend to use
+        use_ov = "moge_depth_ov" in self._compiled
+        ov_moge = None
+        real_moge = None
 
-        # Replace the depth_model's inner model with the real one
-        if hasattr(_pipeline, "depth_model") and _pipeline.depth_model is not None:
-            _pipeline.depth_model.model = real_moge
-            _pipeline.depth_model.device = torch.device("cpu")
+        if use_ov:
+            # Load MoGe config from JSON sidecar
+            import json as _json
+            moge_config_path = self._ov_model_dir / "moge_config.json"
+            moge_config = {}
+            if moge_config_path.exists():
+                with open(moge_config_path, "r") as _f:
+                    moge_config = _json.load(_f)
+                print(f"[OV-SAM3D] Loaded MoGe config from {moge_config_path}")
+            ov_moge = OVMoGe(self._compiled["moge_depth_ov"], config=moge_config)
+        else:
+            try:
+                real_moge = load_real_moge_cpu()
+            except Exception as e:
+                print(
+                    f"[OV-SAM3D] WARNING: Could not load MoGe model ({e}). "
+                    "Falling back to synthetic pointmap data."
+                )
+                return
 
-        # Replace compute_pointmap with a CPU-safe version using real MoGe
-        def _compute_pointmap_real_moge(self_pipe, image, pointmap=None):
+        if not use_ov:
+            # Replace the depth_model's inner model with the real one
+            if hasattr(_pipeline, "depth_model") and _pipeline.depth_model is not None:
+                _pipeline.depth_model.model = real_moge
+                _pipeline.depth_model.device = torch.device("cpu")
+
+        # Replace compute_pointmap with a version using OV or real MoGe
+        _ov_moge_model = ov_moge
+        _real_moge_model = real_moge
+
+        def _compute_pointmap_moge(self_pipe, image, pointmap=None):
             loaded_image = self_pipe.image_to_float(image)
             loaded_image = torch.from_numpy(loaded_image)
             loaded_mask = loaded_image[..., -1] if loaded_image.shape[-1] == 4 else torch.ones(loaded_image.shape[:2])
@@ -3680,9 +4128,20 @@ class _OVPipelineMixin:
             _, H, W = loaded_image_3ch.shape
 
             if pointmap is None:
-                with torch.no_grad():
-                    output = self_pipe.depth_model(loaded_image_3ch)
-                pointmaps = output["pointmaps"]  # (H, W, 3)
+                if _ov_moge_model is not None:
+                    # OV path: OVMoGe now returns same dict as PT depth_model
+                    img_batch = loaded_image_3ch.unsqueeze(0).float()
+                    output = _ov_moge_model(img_batch)
+                    pointmaps = output["pointmaps"]
+                    if pointmaps.dim() == 4:
+                        pointmaps = pointmaps[0]  # Remove batch dim → (H, W, 3)
+                    intrinsics = output.get("intrinsics", None)
+                else:
+                    # PyTorch path
+                    with torch.no_grad():
+                        output = self_pipe.depth_model(loaded_image_3ch)
+                    pointmaps = output["pointmaps"]  # (H, W, 3)
+                    intrinsics = output.get("intrinsics", None)
 
                 # Apply camera convention transform (using CPU Transform3d)
                 try:
@@ -3695,10 +4154,7 @@ class _OVPipelineMixin:
                         camera_transform = CPUTransform3d(matrix=cam_rot.get_matrix())
                     points_tensor = camera_transform.transform_points(pointmaps)
                 except Exception:
-                    # If camera transform fails, use pointmap directly
                     points_tensor = pointmaps
-
-                intrinsics = output.get("intrinsics", None)
             else:
                 points_tensor = pointmap.to(self_pipe.device)
                 if loaded_image_3ch.shape[1:] != points_tensor.shape[:2]:
@@ -3711,7 +4167,6 @@ class _OVPipelineMixin:
             point_map_tensor = {"pts_color": loaded_image_3ch}
 
             if intrinsics is None:
-                # Infer intrinsics from pointmap
                 try:
                     from sam3d_objects.pipeline.inference_pipeline_pointmap import (
                         camera_to_pytorch3d_camera,
@@ -3729,7 +4184,6 @@ class _OVPipelineMixin:
                     )
                     point_map_tensor["intrinsics"] = intrinsics_result["intrinsics"]
                 except Exception:
-                    # Fallback: default pinhole camera intrinsics
                     focal = float(max(H, W))
                     point_map_tensor["intrinsics"] = torch.tensor([
                         [focal, 0.0, W / 2.0],
@@ -3746,12 +4200,15 @@ class _OVPipelineMixin:
 
             return point_map_tensor
 
-        # Bind the new compute_pointmap to the pipeline
         import types as _types
         _pipeline.compute_pointmap = _types.MethodType(
-            _compute_pointmap_real_moge, _pipeline
+            _compute_pointmap_moge, _pipeline
         )
-        print("[OV-SAM3D] MoGe depth model → real PyTorch model on CPU")
+        if use_ov:
+            self._ov_moge = ov_moge
+            print("[OV-SAM3D] MoGe depth model → OV")
+        else:
+            print("[OV-SAM3D] MoGe depth model → real PyTorch model on CPU")
 
     def _patch_autocast(self):
         """Patch torch.autocast('cuda') calls in the pipeline to no-ops."""
