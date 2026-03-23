@@ -2346,6 +2346,7 @@ def convert_slat_decoder_mesh_merged(
         return ov.Core().read_model(str(output_path))
 
     wrapper = SLatMeshDecoderMergedForOV(decoder_model).eval().float()
+    wrapper.base.dtype = torch.float32
     example_feats = torch.randn(n_voxels, latent_channels, dtype=torch.float32)
     example_coords = torch.randint(0, 64, (n_voxels, 3), dtype=torch.float32)
     with torch.no_grad():
