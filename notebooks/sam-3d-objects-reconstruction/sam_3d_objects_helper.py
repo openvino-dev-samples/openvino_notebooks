@@ -1645,6 +1645,10 @@ class SLatDecoderForOV(nn.Module):
         self.pe_mode = decoder_base.pe_mode
         self.dtype = decoder_base.dtype
 
+    def _param_dtype(self):
+        """Return the actual dtype of the module's parameters (respects .float()/.half())."""
+        return self.input_layer.weight.dtype
+
     @torch.no_grad()
     def forward(self, feats, coords_xyz):
         """
@@ -1657,7 +1661,7 @@ class SLatDecoderForOV(nn.Module):
         h = F.linear(feats, self.input_layer.weight, self.input_layer.bias)
         if self.pe_mode == "ape":
             h = h + self.pos_embedder(coords_xyz)
-        h = h.type(self.dtype)
+        h = h.type(self._param_dtype())
 
         for block in self.blocks:
             h = self._sparse_block(block, h)
@@ -1699,12 +1703,16 @@ class SLatMeshDecoderBaseForOV(nn.Module):
         self.pe_mode = decoder_base.pe_mode
         self.dtype = decoder_base.dtype
 
+    def _param_dtype(self):
+        """Return the actual dtype of the module's parameters (respects .float()/.half())."""
+        return self.input_layer.weight.dtype
+
     @torch.no_grad()
     def forward(self, feats, coords_xyz):
         h = F.linear(feats, self.input_layer.weight, self.input_layer.bias)
         if self.pe_mode == "ape":
             h = h + self.pos_embedder(coords_xyz)
-        h = h.type(self.dtype)
+        h = h.type(self._param_dtype())
         for block in self.blocks:
             h = self._sparse_block(block, h)
         h = F.layer_norm(h, h.shape[-1:])
