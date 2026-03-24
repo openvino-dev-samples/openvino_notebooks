@@ -3250,6 +3250,7 @@ class _OVPipelineMixin:
         ov_model_dir: Union[str, Path] = "./ov_models",
         *,
         config_path: Union[str, Path, None] = None,
+        benchmark: bool = False,
     ):
         """
         Parameters
@@ -3262,6 +3263,9 @@ class _OVPipelineMixin:
             Path to ``pipeline.yaml``.  The pipeline skeleton is recreated
             from this config **without loading heavy checkpoint weights**,
             then small sidecar weights are restored.
+        benchmark : bool
+            If True, instrument every OV model with timing hooks and print
+            per-model latency statistics after each pipeline call.
         """
         if config_path is None:
             raise ValueError(
@@ -3270,6 +3274,8 @@ class _OVPipelineMixin:
         self._init_lightweight(config_path, ov_model_dir)
         self._compiled = compiled_models
         self._ov_model_dir = Path(ov_model_dir)
+        self._benchmark = benchmark
+        self._benchmark_stats: Dict[str, List[float]] = {}
         self._patch_embedders()
         self._patch_ss_decoder()
         self._patch_ss_generator()
@@ -3282,6 +3288,119 @@ class _OVPipelineMixin:
         # which drastically degrades quality.
         self.models.eval()
         self._free_replaced_parameters()
+        if self._benchmark:
+            self._install_benchmark_hooks()
+
+    # ------------------------------------------------------------------
+    #  Benchmark hooks
+    # ------------------------------------------------------------------
+    def _install_benchmark_hooks(self):
+        """Wrap every OV wrapper's infer call with timing instrumentation."""
+        import time as _time
+
+        ov_wrapper_types = (
+            OVDinoEmbedder, OVSSDecoder, OVSSGenerator,
+            OVSLatGeneratorCore, OVSLatGeneratorFull, OVSLatDecoder,
+            OVMeshDecoderUpsample, OVMeshDecoderMerged,
+            OVPointPatchEmbedInner, OVMoGe, OVPointProj,
+            OVEmbedderProjection,
+        )
+
+        def _wrap_infer(name, infer_request, stats):
+            orig_infer = infer_request.infer
+
+            def timed_infer(*args, **kwargs):
+                t0 = _time.perf_counter()
+                result = orig_infer(*args, **kwargs)
+                elapsed = _time.perf_counter() - t0
+                stats.setdefault(name, []).append(elapsed)
+                return result
+
+            infer_request.infer = timed_infer
+
+        # Walk all attributes to find OV wrappers and instrument them
+        seen = set()
+        for attr_name in dir(self):
+            try:
+                obj = getattr(self, attr_name)
+            except Exception:
+                continue
+            if isinstance(obj, ov_wrapper_types) and id(obj) not in seen:
+                seen.add(id(obj))
+                _wrap_infer(type(obj).__name__ + f"({attr_name})",
+                            obj._infer_request, self._benchmark_stats)
+
+        # Also instrument wrappers reachable through _compiled-based patches
+        # by scanning common container attributes
+        for container_name in ["condition_embedders", "decoders", "models"]:
+            container = getattr(self, container_name, None)
+            if container is None:
+                continue
+            items = container.items() if hasattr(container, "items") else []
+            for key, mod in items:
+                self._scan_and_wrap(mod, f"{container_name}.{key}",
+                                    ov_wrapper_types, seen, _wrap_infer)
+
+        print(f"[OV-SAM3D] Benchmark mode ON — instrumented {len(seen)} OV wrappers")
+
+    def _scan_and_wrap(self, module, prefix, ov_types, seen, wrap_fn):
+        """Recursively scan a module tree for OV wrappers and instrument them."""
+        if id(module) in seen:
+            return
+        if isinstance(module, ov_types):
+            seen.add(id(module))
+            wrap_fn(type(module).__name__ + f"({prefix})",
+                    module._infer_request, self._benchmark_stats)
+            return
+        # Recurse into nn.Module children
+        if hasattr(module, '_modules'):
+            for child_name, child in module._modules.items():
+                if child is not None:
+                    self._scan_and_wrap(child, f"{prefix}.{child_name}",
+                                        ov_types, seen, wrap_fn)
+        # Check list/tuple attributes for embedder_list style containers
+        for attr in ["embedder_list", "projection_nets", "module_list"]:
+            lst = getattr(module, attr, None)
+            if lst is None:
+                continue
+            for i, item in enumerate(lst):
+                if isinstance(item, tuple):
+                    for j, sub in enumerate(item):
+                        self._scan_and_wrap(sub, f"{prefix}.{attr}[{i}][{j}]",
+                                            ov_types, seen, wrap_fn)
+                else:
+                    self._scan_and_wrap(item, f"{prefix}.{attr}[{i}]",
+                                        ov_types, seen, wrap_fn)
+
+    def _print_benchmark_stats(self):
+        """Print per-model timing summary and reset stats."""
+        if not self._benchmark_stats:
+            print("[OV-SAM3D Benchmark] No OV model calls recorded.")
+            return
+        print("\n" + "=" * 70)
+        print("  OV-SAM3D Benchmark — Per-Model Latency Statistics")
+        print("=" * 70)
+        total_time = 0.0
+        rows = []
+        for name, times in sorted(self._benchmark_stats.items()):
+            n = len(times)
+            total = sum(times)
+            avg = total / n
+            mn = min(times)
+            mx = max(times)
+            total_time += total
+            rows.append((name, n, total, avg, mn, mx))
+        # Print header
+        print(f"  {'Model':<45} {'Calls':>5} {'Total(s)':>9} {'Avg(ms)':>9} "
+              f"{'Min(ms)':>9} {'Max(ms)':>9}")
+        print("-" * 70)
+        for name, n, total, avg, mn, mx in rows:
+            print(f"  {name:<45} {n:>5} {total:>9.3f} {avg*1000:>9.2f} "
+                  f"{mn*1000:>9.2f} {mx*1000:>9.2f}")
+        print("-" * 70)
+        print(f"  {'TOTAL':<45} {'':>5} {total_time:>9.3f}")
+        print("=" * 70 + "\n")
+        self._benchmark_stats.clear()
 
     # ------------------------------------------------------------------
     #  Lightweight initialization from config (no heavy weights)
@@ -3942,6 +4061,9 @@ class _OVPipelineMixin:
             if not (key.startswith("slat_decoder_") and key.endswith("_ov")):
                 continue
             orig_key = key[:-3]  # e.g. "slat_decoder_gs"
+            # Handle merged mesh decoder: "slat_decoder_mesh_merged" → "slat_decoder_mesh"
+            if orig_key == "slat_decoder_mesh_merged":
+                orig_key = "slat_decoder_mesh"
             if orig_key not in self.models:
                 continue
 
@@ -4283,9 +4405,14 @@ class _OVPipelineMixin:
         ``self.run()`` — exactly what the original
         ``demo_single_object.ipynb`` does via ``inference(image, mask, seed=42)``.
         """
+        import time as _time
+
         mask_uint8 = mask.astype(np.uint8) * 255
         rgba_image = np.concatenate([image[..., :3], mask_uint8[..., None]], axis=-1)
-        return self.run(
+        if self._benchmark:
+            self._benchmark_stats.clear()
+            _t_start = _time.perf_counter()
+        result = self.run(
             image=rgba_image,
             mask=None,
             seed=seed,
@@ -4296,6 +4423,11 @@ class _OVPipelineMixin:
             with_layout_postprocess=False,
             use_vertex_color=True,
         )
+        if self._benchmark:
+            _t_total = _time.perf_counter() - _t_start
+            self._print_benchmark_stats()
+            print(f"[OV-SAM3D Benchmark] Pipeline total wall time: {_t_total:.3f}s\n")
+        return result
 
 
 def _ensure_ov_pipeline_class():
@@ -4344,6 +4476,7 @@ def create_ov_pipeline(
     ov_model_dir: Union[str, Path] = "./ov_models",
     ov_device: str = "CPU",
     convert: bool = True,
+    benchmark: bool = False,
 ):
     """
     End-to-end helper: load → patch → convert → wrap.
@@ -4358,6 +4491,8 @@ def create_ov_pipeline(
         OV device string (``CPU``, ``GPU``, …).
     convert : bool
         If *True*, run model conversion if IR files don't exist yet.
+    benchmark : bool
+        If *True*, print per-model latency statistics after each pipeline call.
 
     Returns
     -------
@@ -4383,6 +4518,7 @@ def create_ov_pipeline(
 
     return OVInferencePipelinePointMap(
         compiled, ov_model_dir=ov_model_dir, config_path=config_path,
+        benchmark=benchmark,
     )
 
 
