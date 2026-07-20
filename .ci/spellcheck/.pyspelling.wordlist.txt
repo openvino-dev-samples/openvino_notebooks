@@ -1385,3 +1385,4 @@ deberta
 Deberta
 prioritized
 uvicorn
+DiffSynth's

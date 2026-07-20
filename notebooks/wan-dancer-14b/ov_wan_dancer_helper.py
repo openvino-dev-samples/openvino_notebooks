@@ -580,9 +580,7 @@ def convert_pipeline(
                 # 512 input_ids is the canonical Wan UMT5 prompt length.
                 ov_model = ov.convert_model(
                     te,
-                    example_input={
-                        "input_ids": torch.ones((1, WAN_TEXT_LEN), dtype=torch.long),
-                    },
+                    example_input=torch.ones((1, WAN_TEXT_LEN), dtype=torch.long),
                 )
             if compression_config is not None:
                 ov_model = nncf.compress_weights(ov_model, **compression_config)

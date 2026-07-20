@@ -57,4 +57,6 @@ If you already have a compatible venv (custom OpenVINO wheel, `transformers==4.4
 
 This notebook demonstrates a model that has not been fully validated with OpenVINO. The two-stage hierarchical inference is provided as-is; quality at minute-scale with single-rank OpenVINO is reduced compared to the upstream 8-GPU setup.
 
+🔬 **Validation status at this commit.** The helper API surface (`ov_wan_dancer_helper.py`, `gradio_helper.py`) passes a 7-test unit suite, `black -l 160` + `flake8` lint, `pyspelling` spell-check, and a clean `nbformat.validate` + `openvino_notebooks` metadata block. End-to-end `convert_pipeline` requires the upstream DiffSynth's `xfuser`, `yunchang` and `flash_attn` wheels, which only build on a CUDA host; the custom-built Intel OpenVINO wheel used by this notebook provides shims for those modules so DiffSynth imports succeed but the traced DiT IR won't carry useful attention weights. Run the heavy conversion on a CUDA machine, copy the IRs into `model/{model_global,model_local}/`, and the notebook's `OVWanDancerPipeline` will pick them up directly.
+
 <img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=5b5a4db0-7875-4bfb-bdbd-01698b5b1a77&file=notebooks/wan-dancer-14b/README.md" />
