@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 
 import gradio as gr
 import numpy as np
+import shutil
 from PIL import Image
 
 # -- Sample preset strings (mirror the upstream ``gen_video/prompt/*.txt``) --
@@ -87,8 +88,7 @@ def make_demo(global_pipeline, local_pipeline):
     local_pipeline : ``OVWanDancerPipeline``
         Already-built Stage 2 (local) pipeline.
     """
-    from ov_wan_dancer_helper import extract_music_feature  # local import
-    from moviepy.editor import AudioFileClip, ImageSequenceClip
+    from ov_wan_dancer_helper import extract_music_feature  # noqa: F401  (used by runners below)
 
     default_global_prompt, default_local_prompt = _default_kpop_prompts()
 
@@ -109,8 +109,8 @@ def make_demo(global_pipeline, local_pipeline):
                 label="Music (default bundled)",
             )
 
-        prompt_global_state = gr.State(default_global_prompt)
-        prompt_local_state = gr.State(default_local_prompt)
+        prompt_global_state = gr.State(default_global_prompt)  # noqa: F841
+        prompt_local_state = gr.State(default_local_prompt)  # noqa: F841
 
         with gr.Tab("Stage 1 — Global Keyframe Video"):
             gr.Markdown("Mirrors ``gen_video_global.sh``: 48 diffusion steps, CFG 5.0, " "30 fps; output drives the keyframes for Stage 2.")
@@ -223,6 +223,7 @@ def make_demo(global_pipeline, local_pipeline):
 
 def _run_global(pipeline, refimage, audio_path, prompt, neg_prompt, num_frames, num_steps, cfg_scale, height, width, seed):
     """Stage 1 runner that returns the produced MP4 path + downloadable copy."""
+    from ov_wan_dancer_helper import extract_music_feature
     height, width = int(height), int(width)
     num_frames, num_steps = int(num_frames), int(num_steps)
     cfg_scale = float(cfg_scale)
@@ -254,8 +255,7 @@ def _run_global(pipeline, refimage, audio_path, prompt, neg_prompt, num_frames, 
 
 def _run_local(pipeline, refimage, audio_path, global_video_path, prompt, neg_prompt, num_frames, num_steps, cfg_scale, height, width, seed):
     """Stage 2 runner that consumes ``global_video_path`` and re-attaches audio."""
-    from ov_wan_dancer_helper import extract_keyframes_from_global_video  # local import
-    from moviepy.editor import AudioFileClip, concatenate_videoclips
+    from ov_wan_dancer_helper import extract_keyframes_from_global_video, extract_music_feature
 
     height, width = int(height), int(width)
     num_frames, num_steps = int(num_frames), int(num_steps)
@@ -322,6 +322,4 @@ def _attach_audio(video_path, audio_path):
     final.write_videofile(final_path, codec="libx264", audio_codec="aac", verbose=False, logger=None)
     # Replace the original with the audio-attached version so the user picks
     # up the right file from the download widget.
-    import shutil
-
     shutil.move(final_path, video_path)

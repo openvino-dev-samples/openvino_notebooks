@@ -27,8 +27,8 @@ This helper bridges that world into the OpenVINO runtime:
   that compiles each IR on a user-selected device and runs the upstream
   FlowMatch scheduler loop end-to-end.
 * :func:`extract_music_feature` reproduces the upstream librosa-based
-  music-feature extractor (envelope + 20 mfcc + 12 chroma + peak + beat)
-  that the DiT consumes.
+  music-feature extractor (envelope + 20 mfcc + 12 chroma + peak + beat =
+  35-dim per frame) that the DiT consumes.
 * :func:`extract_keyframes_from_global_video` reproduces
   ``process_global_video_firstlastframe`` from
   ``gen_video/gen_video_local.py`` for the Stage 2 conditioning input.
@@ -44,10 +44,8 @@ Quick usage:
 from __future__ import annotations
 
 import gc
-import html
 import json
 import os
-import re
 import shutil
 import sys
 import warnings
@@ -217,10 +215,13 @@ def extract_music_feature(
         2) 20 MFCC coefficients
         3) 12 Chroma CENS coefficients
         4) Onset-peak one-hot (1 ch)
-        5) Beat one-hot (1 ch)
+        5) Beat one-hot one-hot (1 ch)
 
-    Total: ``36`` channels per frame, matching the DiffSynth
-    ``enable_music_inject`` input layout.
+    Total: ``35`` channels per frame, matching the DiffSynth
+    ``enable_music_inject`` input layout (the upstream README quotes 36, but
+    the reference DiffSynth path concatenates 1+20+12+1+1 = 35; if your
+    checkpoint expects a 36-dim feature we expose this gap for a future
+    custom-calibration step).
 
     The audio is resampled so that ``len(envelope) == num_frames`` (one feature
     vector per frame at the project's 30 fps default).
@@ -352,7 +353,7 @@ def extract_keyframes_from_global_video(
     else:
         keyframes = arr
 
-    mask = torch.ones(keyframes.shape[0], 1, *keyframes.shape[2:], dtype=torch.float32)
+    mask = torch.ones(keyframes.shape[0], 1, keyframes.shape[-2], keyframes.shape[-1], dtype=torch.float32)
     return keyframes, mask
 
 
@@ -454,8 +455,6 @@ def _load_wan_model(
     use in the notebook shape (i.e. ``enable_music_inject``, ``enable_refimage``,
     ``enable_global``) influence the traced graph here.
     """
-    from diffusers.loaders.safetensors_utils import _get_safetensors_metadata
-
     weight_path = Path(weight_path)
     if not weight_path.exists():
         raise FileNotFoundError(f"Weight not found: {weight_path}")
@@ -1060,7 +1059,6 @@ class OVWanDancerPipeline(DiffusionPipeline):
         # 6) Denoise with FlowMatchScheduler.
         self.scheduler.set_timesteps(num_inference_steps)
         timesteps = self.scheduler.timesteps
-        generator = torch.Generator().manual_seed(seed)
 
         for t in timesteps:
             latent_model_input = (1 - first_frame_mask) * (latent_cond - latent_mean) / latent_std + first_frame_mask * latents
