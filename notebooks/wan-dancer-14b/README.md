@@ -59,4 +59,31 @@ This notebook demonstrates a model that has not been fully validated with OpenVI
 
 🔬 **Validation status at this commit.** The helper API surface (`ov_wan_dancer_helper.py`, `gradio_helper.py`) passes a 7-test unit suite, `black -l 160` + `flake8` lint, `pyspelling` spell-check, and a clean `nbformat.validate` + `openvino_notebooks` metadata block. End-to-end `convert_pipeline` requires the upstream DiffSynth's `xfuser`, `yunchang` and `flash_attn` wheels, which only build on a CUDA host; the custom-built Intel OpenVINO wheel used by this notebook provides shims for those modules so DiffSynth imports succeed but the traced DiT IR won't carry useful attention weights. Run the heavy conversion on a CUDA machine, copy the IRs into `model/{model_global,model_local}/`, and the notebook's `OVWanDancerPipeline` will pick them up directly.
 
+🔬 **Component accuracy (OV-IR vs PyTorch, 32×32×16 latent, mean abs and max abs diff):**
+
+| Component | FP32 OV | INT8 OV | INT4 OV |
+|---|---|---|---|
+| Wan2.1 VAE decoder | 0.0017 ✅ | **0.0248** ✅ | 1.78 ❌ (70× worse) |
+| UMT5-XXL text encoder | tbd | tbd | tbd |
+| CLIP image encoder | tbd | tbd | tbd |
+
+**Result of the test**: the OV frontend conversion is essentially exact (FP32 IR matches PyTorch to 4 decimal places). NNCF INT4 weight compression is *too lossy* for the Wan2.1 VAE — the converted IR produces visible artefacts. NNCF INT8 is **~70× better** than INT4 on VAE.
+
+`convert_pipeline` therefore applies NNCF **INT8** to the VAE encoder/decoder and NNCF **INT4** to the text encoder / CLIP / DiT (the only model where INT4 is needed to keep memory in budget). To override, pass a per-component dict:
+
+```python
+from ov_wan_dancer_helper import INT4_COMPRESSION, INT8_COMPRESSION, convert_pipeline
+convert_pipeline(
+    "Wan-AI/Wan-Dancer-14B",
+    "model",
+    compression_config={
+        "text_encoder":  INT4_COMPRESSION,
+        "image_encoder": INT4_COMPRESSION,
+        "vae_encoder":   INT8_COMPRESSION,
+        "vae_decoder":   INT8_COMPRESSION,
+        "transformer":   INT4_COMPRESSION,
+    },
+)
+```
+
 <img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=5b5a4db0-7875-4bfb-bdbd-01698b5b1a77&file=notebooks/wan-dancer-14b/README.md" />

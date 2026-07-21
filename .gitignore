@@ -112,3 +112,20 @@ pipcache_openvino/
 
 # PySpelling generated dictionary
 .ci/spellcheck/dictionary
+
+notebooks/wan-dancer-14b/_tmp_*.xml
+notebooks/wan-dancer-14b/_tmp_*.bin
+notebooks/wan-dancer-14b/output_int8_*.mp4
+notebooks/wan-dancer-14b/_tmp_*.xml
+notebooks/wan-dancer-14b/_tmp_*.bin
+notebooks/wan-dancer-14b/output_int8_*.mp4
+notebooks/wan-dancer-14b/output_*.png
+notebooks/wan-dancer-14b/prod_vae_*.png
+notebooks/wan-dancer-14b/vae_*.png
+notebooks/wan-dancer-14b/vae_ov_frame_*.png
+notebooks/wan-dancer-14b/vae_pt_frame_*.png
+notebooks/wan-dancer-14b/assets/
+notebooks/wan-dancer-14b/model_global/
+notebooks/wan-dancer-14b/model_local/
+notebooks/wan-dancer-14b/vae_pt_*.png
+notebooks/wan-dancer-14b/vae_ov_*.png
