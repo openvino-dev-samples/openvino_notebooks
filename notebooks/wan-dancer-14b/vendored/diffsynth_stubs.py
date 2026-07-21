@@ -19,7 +19,38 @@ def _ensure_shim(_module_name: str, _module) -> None:
 
 
 def install_diffusion_stubs() -> None:
-    """Idempotently install xfuser / yunchang / flash_attn shims."""
+    """Idempotently install xfuser / yunchang / flash_attn shims and force CPU."""
+    import os as _os
+    # Force PyTorch to stay on CPU. Without this, nn.MultiheadAttention's lazy
+    # initialiser probes CUDA and aborts the construction ("Torch not compiled
+    # with CUDA enabled"). Setting CUDA_VISIBLE_DEVICES="" is the standard way
+    # to disable CUDA detection in CPU-only sub-processes.
+    _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    _os.environ.setdefault("TORCH_USE_CUDA_DSA", "0")
+    # Apply runtime shims for libraries we run on CPU-only.
+    _patch_numpy_long()
+    _patch_llvmlite_no_deprecation()
+    # Belt-and-suspenders: even with the env var, recent PyTorch versions
+    # still call into ``torch.cuda._lazy_init()`` from ``torch.empty`` when
+    # device is unset. Patch the gate to a no-op so any downstream import
+    # that constructs tensors stays on CPU.
+    try:
+        import torch as _t  # noqa: F401 - imported lazily on purpose
+        _t.cuda.is_available = lambda: False  # type: ignore[assignment]
+        _t.cuda._lazy_init = lambda: None  # type: ignore[assignment]
+        # nn.MultiheadAttention calls ``torch.empty((3*E, E), ...)`` with no
+        # dtype/device. Without CUDA we want plain float32 on CPU.
+        _orig_empty = _t.empty
+
+        def _cpu_empty(*a, **kw):
+            kw.pop("device", None)
+            return _orig_empty(*a, **kw)
+
+        _t.empty = _cpu_empty  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001
+        # If torch isn't importable yet, the env vars above are still in
+        # place by the time it is.
+        pass
 
     # ---- xfuser (useless without distributed init, all calls return 0) ------
     if "xfuser" not in _sys.modules:
@@ -116,3 +147,44 @@ def install_diffusion_stubs() -> None:
 if __name__ == "__main__":
     install_diffusion_stubs()
     print("Installed DiffSynth stubs: xfuser, yunchang, flash_attn")
+
+
+def _patch_numpy_long() -> None:
+    """``transformers`` T5 modules use ``numpy.long`` for type annotations
+    but that attribute disappeared in numpy >= 1.20. Re-add it so the import
+    succeeds. (No-op when numpy already exposes ``long``.)
+    """
+    try:
+        import numpy as _np
+        if not hasattr(_np, "long"):
+            _np.long = _np.int_  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _patch_llvmlite_no_deprecation() -> None:
+    """``llvmlite>=0.46`` deprecated ``binding.initfini.initialize`` and the
+    shipped Python function unconditionally raises ``RuntimeError`` — which
+    breaks ``numba``'s lazy LLVM inits. Modern LLVM is auto-initialised so a
+    no-op stub is safe for our CPU-only flow.
+    """
+    try:
+        import llvmlite.binding as _lb  # noqa: F401 - parent module
+        import llvmlite.binding.initfini as _if  # noqa: F401 - submodule
+
+        def _noop_initialize():
+            return None
+
+        # Numba resolves ``ll.initialize()`` via the parent module first.
+        # Patch every alias we can find so whichever path is used, the
+        # no-op is returned instead of the legacy body that raises.
+        _if.initialize = _noop_initialize  # type: ignore[assignment]
+        if hasattr(_lb, "initialize"):
+            _lb.initialize = _noop_initialize  # type: ignore[attr-defined]
+        # Some call sites (e.g. ``from llvmlite.binding.initfini import
+        # initialize``) bound the legacy name into the importing module's
+        # namespace at import time; we cannot reach those without an
+        # import hook, but ``lb.initialize`` and ``lb.initfini.initialize``
+        # cover the numba call site.
+    except Exception:
+        pass

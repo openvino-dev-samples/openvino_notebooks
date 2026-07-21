@@ -224,6 +224,7 @@ def make_demo(global_pipeline, local_pipeline):
 def _run_global(pipeline, refimage, audio_path, prompt, neg_prompt, num_frames, num_steps, cfg_scale, height, width, seed):
     """Stage 1 runner that returns the produced MP4 path + downloadable copy."""
     from ov_wan_dancer_helper import extract_music_feature
+
     height, width = int(height), int(width)
     num_frames, num_steps = int(num_frames), int(num_steps)
     cfg_scale = float(cfg_scale)
@@ -304,7 +305,8 @@ def _save_video(frames_tensor, out_path, fps: int = 30):
     """Save a [1, F, 3, H, W] tensor to an MP4 via ``imageio[ffmpeg]``."""
     import imageio.v2 as imageio
 
-    frames = frames_tensor[0].clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy()
+    # frames_tensor has shape (B, C, F, H, W). We want (F, H, W, C) for imageio.
+    frames = frames_tensor[0].clamp(0, 1).permute(1, 2, 3, 0).cpu().numpy()
     frames = (frames * 255).round().astype(np.uint8)
     imageio.mimsave(out_path, list(frames), fps=fps, codec="libx264", quality=8)
     return out_path
