@@ -73,7 +73,7 @@ install_diffusion_stubs()
 
 # DiffSynth pieces (resolved only after the stubs above are in place).
 from diffsynth.schedulers.flow_match import FlowMatchScheduler  # noqa: E402
-from diffsynth.models.wan_video_dit import WanModel  # noqa: E402
+from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d  # noqa: E402
 from diffsynth.models.wan_video_text_encoder import WanTextEncoder  # noqa: E402
 from diffsynth.models.wan_video_image_encoder import WanImageEncoder  # noqa: E402
 from diffsynth.models.wan_video_vae import WanVideoVAE  # noqa: E402
@@ -533,20 +533,32 @@ def download_default_music(target: Union[str, Path] = "assets/default_music.wav"
 def _load_wan_model(
     weight_path: Path,
     dtype: torch.dtype = torch.float16,
-    enable_music_inject: bool = False,
-    enable_refimage: bool = False,
-    enable_global: bool = False,
-    enable_dynamicfps: bool = False,
-    enable_unimodel: bool = False,
-    has_image_input: bool = False,
+    enable_music_inject: bool = True,
+    enable_refimage: bool = True,
+    enable_global: bool = True,
+    enable_dynamicfps: bool = True,
+    enable_unimodel: bool = True,
+    has_image_input: bool = True,
 ) -> WanModel:
     """Instantiate DiffSynth ``WanModel`` and load our checkpoint (one of the
     two DiTs).
 
-    By default every Wan-Dancer-specific conditioning is **off** so the OV
-    trace succeeds on CPU; the resulting IR is text-only (the underlying
-    Wan2.1 14B backbone) — meaningful dance alignment requires a CUDA host.
-    See ``convert_pipeline`` for the broader rationale.
+    The Wan-Dancer checkpoints (``dit_model_type=1`` / "MIT2V") are trained
+    with **every** conditioning branch enabled — see upstream
+    ``gen_video/gen_video_global.py`` / ``gen_video/gen_video_local.py``
+    ``init_dit_model()``, which always constructs the pipeline with
+    ``enable_music_inject=True, enable_refimage=True, enable_global=True,
+    enable_dynamicfps=True, enable_unimodel=True`` (and ``has_image_input``
+    implied by the checkpoint's ``in_dim=36``). Building the model with any
+    of these flags off means the corresponding submodules
+    (``img_emb``/``img_emb_refimage``/``music_injector``/``music_projection``/
+    ``music_encoder``/``head_global``/...) are never created, so
+    ``load_state_dict(..., strict=False)`` silently *drops* those trained
+    weights — this was the root cause of the notebook producing noise: large
+    parts of the checkpoint were never loaded, and the parts that did load
+    were driven with zeroed-out conditioning. Keep these flags matching the
+    checkpoint; see ``get_errors``/missing-keys diagnostics printed below if
+    that ever regresses.
     """
     weight_path = Path(weight_path)
     if not weight_path.exists():
@@ -575,7 +587,13 @@ def _load_wan_model(
     # weights in a non-flat dict. Pick the easy path for the demos.
     if any(k.startswith("model.") for k in state_dict):
         state_dict = {k[len("model.") :]: v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(f"⚠️ DiT load ({weight_path.name}): missing={len(missing)} unexpected={len(unexpected)}")
+        if missing:
+            print(f"   e.g. missing: {missing[:5]}")
+        if unexpected:
+            print(f"   e.g. unexpected: {unexpected[:5]}")
     # Aggressively cast every parameter AND buffer to fp16 — DiffSynth
     # leaves bias on the convs in fp32 while the conv weights are bf16/fp16,
     # which would otherwise trip the c10 type check during tracing.
@@ -612,9 +630,15 @@ def _load_image_encoder(weight_path: Path) -> WanImageEncoder:
 def _load_vae(weight_path: Path) -> WanVideoVAE:
     vae = WanVideoVAE()
     state_dict = _load_state_dict(weight_path)
-    if any(k.startswith("vae.") for k in state_dict):
-        state_dict = {k[len("vae.") :]: v for k, v in state_dict.items()}
-    vae.load_state_dict(state_dict, strict=False)
+    # The flat Wan2.1_VAE.pth checkpoint has no top-level prefix; the
+    # WanVideoVAE's ``state_dict()`` keys live under ``model.encoder.*`` /
+    # ``model.decoder.*``, so we must add the ``model.`` prefix before load.
+    # (The earlier ``vae.`` strip was a bug that left weights uninitialised
+    # and the traced IR produced colourful noise on every roundtrip.)
+    state_dict = {f"model.{k}" if not k.startswith("model.") else k: v for k, v in state_dict.items()}
+    missing, unexpected = vae.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(f"⚠️ VAE load: missing={len(missing)} unexpected={len(unexpected)}")
     vae.eval()
     return vae
 
@@ -888,34 +912,23 @@ def convert_pipeline(
     # ===== Global DiT (34.5 GB) =============================================
     if not (global_root / GLOBAL_TRANSFORMER_PATH).exists():
         print("⌛ Converting Global DiT (34.5 GB weights; takes ~10–15 min)…")
-        # NOTE: every Wan-Dancer-specific conditioning is disabled at
-        # ``WanModel`` construction time. The image-conditioning concat
-        # (``has_image_input=True``) requires a 20-channel ``y`` tensor that
-        # we cannot produce from the 3-channel PIL image alone, and the
-        # music-injection branch (``enable_music_inject=True``) crashes the
-        # TorchScript trace when handed a small test input. Together they
-        # make full upstream-fidelity tracing infeasible on CPU. The
-        # resulting IR is a text-to-video DiT with the same 14B backbone —
-        # producing real video motion in CPU-only mode requires a CUDA host.
-        # We document this in the README's "Validation status".
-        gm = _load_wan_model(
-            local_dir / CHECKPOINTS["global"],
-            enable_music_inject=False,
-            enable_refimage=False,
-            enable_global=False,
-            enable_dynamicfps=False,
-            enable_unimodel=False,
-            has_image_input=False,
-        )
+        # NOTE: the checkpoint (``dit_model_type=1``, "MIT2V") is trained with
+        # *every* Wan-Dancer conditioning branch enabled (see
+        # ``gen_video_global.py``/``gen_video_local.py`` ``init_dit_model()``).
+        # We must construct the model with the same flags so the real
+        # trained submodules (img_emb, img_emb_refimage, music_projection,
+        # music_encoder, music_injector) exist and their weights are loaded
+        # instead of silently dropped by ``strict=False``.
+        gm = _load_wan_model(local_dir / CHECKPOINTS["global"])
         try:
             _convert_dit(gm, global_root / GLOBAL_TRANSFORMER_PATH, compression_config, trace_frames, trace_height, trace_width)
-            print("✅ Global DiT converted (text-only conditioning).")
+            print("✅ Global DiT converted (full music + ref-image conditioning).")
         except Exception as exc:  # noqa: BLE001 - best-effort, see comments
-            # The DiT trace is unstable on CPU even with all upstream-fidelity
-            # flags disabled (xfuser/yunchang stubs return no-op shapes, mixed
-            # fp16/fp32 buffers inside DiffSynth). Mark the IR as "skipped"
-            # by writing a sentinel 0-byte file. The downstream pipeline
-            # detects this and falls back to random latents at inference time.
+            # The DiT trace can still fail on CPU (memory pressure at 14B
+            # scale, or an operator unsupported by this OV build). Mark the
+            # IR as "skipped" by writing a sentinel 0-byte file. The
+            # downstream pipeline detects this and falls back to random
+            # latents at inference time rather than crashing the notebook.
             sentinel = global_root / GLOBAL_TRANSFORMER_PATH
             sentinel.parent.mkdir(parents=True, exist_ok=True)
             sentinel.write_text("")  # empty file = marker
@@ -928,18 +941,10 @@ def convert_pipeline(
     # ===== Local DiT (34.5 GB) ==============================================
     if not (local_root / LOCAL_TRANSFORMER_PATH).exists():
         print("⌛ Converting Local DiT (34.5 GB weights; takes ~10–15 min)…")
-        lm = _load_wan_model(
-            local_dir / CHECKPOINTS["local"],
-            enable_music_inject=False,
-            enable_refimage=False,
-            enable_global=False,
-            enable_dynamicfps=False,
-            enable_unimodel=False,
-            has_image_input=False,
-        )
+        lm = _load_wan_model(local_dir / CHECKPOINTS["local"])
         try:
             _convert_dit(lm, local_root / LOCAL_TRANSFORMER_PATH, compression_config, trace_frames, trace_height, trace_width)
-            print("✅ Local DiT converted (text-only conditioning).")
+            print("✅ Local DiT converted (full music + ref-image conditioning).")
         except Exception as exc:  # noqa: BLE001 - best-effort
             sentinel = local_root / LOCAL_TRANSFORMER_PATH
             sentinel.parent.mkdir(parents=True, exist_ok=True)
@@ -957,26 +962,122 @@ def convert_pipeline(
     print(f"✅ All Wan-Dancer components saved to {output_dir}/{{model_global,model_local}}.")
 
 
+# Raw librosa-style music feature dimensionality (RMS envelope[1] + MFCC[20]
+# + chroma[12] + onset-peak[1] + beat[1] = 35), matching upstream
+# ``get_music_base_feature`` in ``gen_video_global.py``/``gen_video_local.py``.
+WAN_MUSIC_FEATURE_DIM = 35
+# ``model_fn_wan_video``'s "encode global music feature" step always resizes
+# the per-frame music embedding to this fixed (frames, channels) grid before
+# it is re-interpolated to the DiT's hidden size, regardless of the actual
+# number of frames being generated.
+WAN_MUSIC_ENCODE_FRAMES = 149
+WAN_MUSIC_ENCODE_DIM = 4800
+
+
+class _DiTWrapper(torch.nn.Module):
+    """Reimplements ``model_fn_wan_video`` from upstream
+    ``diffsynth/pipelines/wan_video_new.py`` as a plain ``forward()`` so it
+    can be traced by OpenVINO.
+
+    The real Wan-Dancer inference pipeline does **not** call
+    ``WanModel.forward()`` directly - it calls a free function
+    (``model_fn_wan_video``) that manually drives the DiT's submodules
+    (``time_embedding``, ``text_embedding``, ``patch_embedding``, ``img_emb``,
+    ``img_emb_refimage``, ``music_projection``, ``music_encoder``, the
+    transformer ``blocks``, and ``head``) so it can splice in the
+    music-injection and reference-image conditioning. This wrapper
+    reproduces that single-device (no Ulysses-USP / VACE / motion-controller
+    / TeaCache) code path with a fixed ``fps == 30`` assumption - the
+    ``enable_dynamicfps``/``enable_unimodel`` "non-30fps" branch (which swaps
+    in ``patchify_global``/``head_global`` and rescales RoPE for oddly-sized
+    music clips) is not reproduced here, since it depends on a *runtime*
+    scalar ``fps`` value that a static OpenVINO graph cannot branch on.
+    """
+
+    def __init__(self, m: WanModel):
+        super().__init__()
+        self.m = m
+
+    def forward(self, x, timestep, context, clip_feature, y, refimage_feature, music_feature):
+        dit = self.m
+        t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+        t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+        context = dit.text_embedding(context)
+
+        frame_num = x.shape[2]
+
+        # ``has_image_input``: concat the image-conditional latent/mask onto
+        # the noise channel dim, and prepend its CLIP embedding to context.
+        x = torch.cat([x, y], dim=1)
+        clip_embedding = dit.img_emb(clip_feature)
+        context = torch.cat([clip_embedding, context], dim=1)
+
+        # ``enable_refimage``: prepend the (separately CLIP-encoded)
+        # reference-image embedding to context (goes *before* clip_embedding,
+        # matching upstream ordering, since ``CrossAttention`` treats the
+        # first 257 context tokens as the "image" branch).
+        refimage_embedding = dit.img_emb_refimage(refimage_feature)
+        context = torch.cat([refimage_embedding, context], dim=1)
+
+        x, (f, h, w) = dit.patchify(x)
+        context_shape_end = context.shape[2]
+
+        freqs = torch.cat(
+            [
+                dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(f * h * w, 1, -1).to(x.device)
+
+        # "encode global music feature": always runs when enable_global /
+        # enable_dynamicfps / enable_unimodel are set (they are, for this
+        # checkpoint), independent of the fps branch above.
+        music_feature = dit.music_projection(music_feature)
+        music_feature = dit.music_encoder(music_feature)
+        if music_feature.dim() == 2:
+            music_feature = music_feature.unsqueeze(0)
+        music_feature = music_feature.unsqueeze(1)
+        music_feature = torch.nn.functional.interpolate(
+            music_feature, size=(WAN_MUSIC_ENCODE_FRAMES, WAN_MUSIC_ENCODE_DIM), mode="bilinear"
+        )
+        music_feature = music_feature.squeeze(1)
+
+        # ``enable_music_inject`` with ``interp_mode="bilinear"`` (both
+        # upstream gen_video_global.py/gen_video_local.py always set this).
+        music_feature = music_feature.unsqueeze(1)
+        music_feature = torch.nn.functional.interpolate(music_feature, size=(frame_num * 8, context_shape_end), mode="bilinear")
+        dit.merged_audio_emb = music_feature.squeeze(1)
+
+        for block_id, block in enumerate(dit.blocks):
+            x = block(x, context, t_mod, freqs)
+            x = dit.after_transformer_block(block_id, x)  # music injector
+
+        x = dit.head(x, t)
+        x = dit.unpatchify(x, (f, h, w))
+        return x
+
+
 def _convert_dit(model: WanModel, target: Path, compression_config: Optional[dict], trace_frames: int, trace_height: int, trace_width: int) -> None:
-    """Trace a DiffSynth ``WanModel`` DiT into OpenVINO IR.
+    """Trace a DiffSynth ``WanModel`` DiT into OpenVINO IR via ``_DiTWrapper``.
 
-    The traced inputs match the upstream ``WanVideoPipeline.__call__`` arg
-    list. We use very small latent shapes here; ``OVWanDancerPipeline``
-    uses OpenVINO ``reshape`` at inference to bring them up to full
-    production size.
+    We use very small latent shapes here; ``OVWanDancerPipeline`` uses
+    OpenVINO ``reshape`` at inference to bring them up to full production
+    size.
 
-    The forward expects:
+    The traced graph expects:
 
-      * ``latents``           : ``[1, 36, F, H, W]`` — 16 ch noise
-                                                + 20 ch image-conditional concat
-      * ``timestep``          : ``[1]``            — scalar in ``[0, 1000]``
-      * ``text_embeds``       : ``[1, 512, 4096]`` — UMT5 output
-      * ``image_embeds``      : ``[1, 257, 1280]`` — CLIP-ViT-H/14 output
-      * ``music_feature``     : ``[1, F, 36]``    — extracted via
-                                                    :func:`extract_music_feature`
-      * ``refimage``          : ``[1, 3, H, W]``  — pre-encoded PIL image
-      * ``keyframes``         : ``[1, 16, 1, H_lat, W_lat]`` (optional)
-      * ``keyframes_mask``    : ``[1, 16, 1, H_lat, W_lat]`` (optional)
+      * ``x``                 : ``[1, 16, F, H_lat, W_lat]`` — noise latents
+      * ``timestep``           : ``[1]``            — scalar in ``[0, 1000]``
+      * ``context``            : ``[1, 512, 4096]``  — UMT5 text embeds
+      * ``clip_feature``       : ``[1, 257, 1280]``  — CLIP embed of keyframe 0
+      * ``y``                  : ``[1, 20, F, H_lat, W_lat]`` — mask(4ch) +
+                                  VAE-encoded keyframe/ref latent(16ch)
+      * ``refimage_feature``   : ``[1, 257, 1280]``  — CLIP embed of the
+                                  reference image (``enable_refimage`` path)
+      * ``music_feature``      : ``[1, F, 35]``      — raw per-frame librosa
+                                  feature (see :func:`extract_music_feature`)
     """
     # Cast every parameter + buffer to fp16 — DiffSynth leaves bias on
     # the convs in fp32 while the conv weights are bf16/fp16, which would
@@ -993,62 +1094,16 @@ def _convert_dit(model: WanModel, target: Path, compression_config: Optional[dic
     latent_h = trace_height // VAE_SCALE_S
     latent_w = trace_width // VAE_SCALE_S
 
-    # WanModel.forward signature (with has_image_input=True so the
-    # checkpoint loads, but we feed zeros for ``y`` and ``clip_feature`` at
-    # trace time. The traced graph therefore still has the image-conditioning
-    # path even though we don't exercise it. At runtime we again feed zeros
-    # which is sufficient to get a populated frame tensor back — the
-    # inference time path produces a video that is uncorrelated with the
-    # reference image, but it produces a video nonetheless.
-    class _DiTWrapper(torch.nn.Module):
-        def __init__(self, m):
-            super().__init__()
-            self.m = m
-
-        def forward(
-            self,
-            latents,
-            timestep,
-            text_embeds,
-            image_embeds=None,
-            music_feature=None,
-            refimage=None,
-            keyframes=None,
-            keyframes_mask=None,
-        ):
-            B, _, F, H, W = latents.shape
-            # ``y`` is the image-conditional concat target, [B, 20, F, H, W].
-            y = torch.zeros(
-                B,
-                WAN_IN_DIM - WAN_OUT_DIM,
-                F,
-                H,
-                W,
-                dtype=torch.float16,
-                device=latents.device,
-            )
-            return self.m(
-                latents,
-                timestep,
-                text_embeds,
-                clip_feature=image_embeds,
-                y=y,
-            )
-
     wrapped = _DiTWrapper(model)
     __make_16bit_traceable(wrapped)
     example_inputs = {
-        "latents": torch.zeros(
-            (1, WAN_OUT_DIM, trace_frames, latent_h, latent_w),
-            dtype=torch.float16,
-        ),
+        "x": torch.zeros((1, WAN_OUT_DIM, trace_frames, latent_h, latent_w), dtype=torch.float16),
         "timestep": torch.zeros((1,), dtype=torch.float16),
-        "text_embeds": torch.zeros((1, WAN_TEXT_LEN, WAN_TEXT_DIM), dtype=torch.float16),
-        "image_embeds": torch.zeros((1, 257, 1280), dtype=torch.float16),
-        "music_feature": torch.zeros((1, trace_frames, 36), dtype=torch.float16),
-        "refimage": torch.zeros((1, 3, trace_height, trace_width), dtype=torch.float16),
-        "keyframes": torch.zeros((1, WAN_OUT_DIM, 1, latent_h, latent_w), dtype=torch.float16),
-        "keyframes_mask": torch.zeros((1, WAN_OUT_DIM, 1, latent_h, latent_w), dtype=torch.float16),
+        "context": torch.zeros((1, WAN_TEXT_LEN, WAN_TEXT_DIM), dtype=torch.float16),
+        "clip_feature": torch.zeros((1, 257, 1280), dtype=torch.float16),
+        "y": torch.zeros((1, WAN_IN_DIM - WAN_OUT_DIM, trace_frames, latent_h, latent_w), dtype=torch.float16),
+        "refimage_feature": torch.zeros((1, 257, 1280), dtype=torch.float16),
+        "music_feature": torch.zeros((1, trace_frames, WAN_MUSIC_FEATURE_DIM), dtype=torch.float16),
     }
 
     with torch.no_grad():
@@ -1271,6 +1326,54 @@ class OVWanDancerPipeline(DiffusionPipeline):
         arr = arr.transpose(2, 0, 1)[None]  # [1, 3, 224, 224]
         return torch.from_numpy(self.image_encoder(arr)[0])
 
+    def _encode_keyframe_conditioning(
+        self,
+        keyframe_image: Image.Image,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build ``(clip_feature, y)`` the way upstream's
+        ``WanVideoUnit_ImageKeyframesEmbedder`` / ``WanVideoUnit_ImageEmbedder``
+        do: ``clip_feature`` is the CLIP embedding of the conditioning
+        keyframe and ``y`` is ``concat([mask(4ch), vae_latent(16ch)], dim=1)``
+        with the mask set to 1 only at the conditioned frame.
+
+        This notebook's VAE/DiT IRs are traced with a tiny, fixed temporal
+        window, so (unlike the full multi-keyframe upstream path) we can only
+        faithfully condition a single frame (index 0).
+        """
+        clip_feature = self._encode_image(keyframe_image)
+
+        image_tensor = torch.from_numpy(
+            np.asarray(keyframe_image.convert("RGB").resize((width, height), Image.BICUBIC), dtype=np.float32).transpose(2, 0, 1)[None] / 127.5 - 1.0,
+        ).unsqueeze(
+            2
+        )  # [1, 3, 1, H, W]
+        # Pad the time axis to 2 × VAE_SCALE_T (i.e. trace_frames) so the
+        # VAE encoder, which was traced with that temporal shape, processes
+        # a complete window.
+        if image_tensor.shape[2] < VAE_SCALE_T * 2:
+            image_tensor = torch.cat(
+                [
+                    image_tensor,
+                    image_tensor[:, :, -1:].expand(1, 3, VAE_SCALE_T * 2 - image_tensor.shape[2], height, width),
+                ],
+                dim=2,
+            )
+        latent = torch.from_numpy(self.vae_encoder(image_tensor.float())[0])
+        latent = latent[:, :, :1]  # keep only the conditioned frame's latent
+
+        num_latent_frames = max(1, (num_frames - 1) // self.vae_scale_factor_temporal + 1)
+        latent_h = height // self.vae_scale_factor_spatial
+        latent_w = width // self.vae_scale_factor_spatial
+        msk = torch.zeros(1, 4, num_latent_frames, latent_h, latent_w, dtype=latent.dtype)
+        msk[:, :, 0] = 1.0  # frame 0 is the conditioned keyframe
+        latent_full = torch.zeros(1, VAE_Z_DIM, num_latent_frames, latent_h, latent_w, dtype=latent.dtype)
+        latent_full[:, :, :1] = latent
+        y = torch.cat([msk, latent_full], dim=1)  # [1, 20, T, H_lat, W_lat]
+        return clip_feature, y
+
     # ------------------------------------------------------------------
     # Latents preparation
     # ------------------------------------------------------------------
@@ -1300,11 +1403,23 @@ class OVWanDancerPipeline(DiffusionPipeline):
         cfg_scale: float = 5.0,
         seed: int = 0,
     ) -> WanDancerPipelineOutput:
-        """Run the OpenVINO Wan-Dancer pipeline end-to-end.
+        """Run the OpenVINO Wan-Dancer pipeline end-to-end, mirroring
+        upstream ``model_fn_wan_video``'s conditioning wiring:
 
-        ``music_feature`` must be either ``None`` (which lets the pipeline
-        use a zero vector) or a ``[num_frames, 36]`` float numpy array
-        produced by :func:`extract_music_feature`.
+        * ``refimage`` is CLIP-encoded into ``refimage_feature`` and
+          prepended to the text context (``enable_refimage`` /
+          ``dit.img_emb_refimage``).
+        * The conditioning keyframe (``keyframes`` if given - i.e. the frame
+          extracted from the Stage-1 video for Stage 2 - otherwise
+          ``refimage`` itself, matching upstream's Stage-1
+          ``keyframes[0] = input_image``) is CLIP-encoded into
+          ``clip_feature`` and VAE-encoded (+ a validity mask) into ``y``,
+          concatenated onto the noise channel dim (``has_image_input``).
+        * ``music_feature`` must be either ``None`` (silence) or a
+          ``[num_frames, 35]`` float numpy array produced by
+          :func:`extract_music_feature`; it is projected/encoded by the DiT's
+          own ``music_projection``/``music_encoder`` submodules (baked into
+          the traced IR) exactly like upstream ``model_fn_wan_video``.
         """
         height, width = _round_div(height, 16), _round_div(width, 16)
         if num_frames % 4 != 1:
@@ -1315,78 +1430,59 @@ class OVWanDancerPipeline(DiffusionPipeline):
         if not neg_prompts:
             neg_prompts = [""]
 
-        # 1) Encode text + reference image (ref-image is required by the
-        # upstream pipeline via ``enable_refimage=True``).
+        # 1) Encode text + reference image.
         prompt_embeds, negative_embeds = self._encode_text(prompts, neg_prompts)
         if refimage is None:
-            refimage = Image.new("RGB", (height, width), color=(127, 127, 127))
-        image_embeds = self._encode_image(refimage)
+            refimage = Image.new("RGB", (width, height), color=(127, 127, 127))
+        refimage_feature = self._encode_image(refimage)
 
-        # 2) Encode the reference image as the first latent frame so the
-        # DiT can fix it during diffusion.
-        image_tensor = torch.from_numpy(
-            np.asarray(refimage.convert("RGB").resize((width, height), Image.BICUBIC), dtype=np.float32).transpose(2, 0, 1)[None] / 127.5 - 1.0,
-        ).unsqueeze(
-            2
-        )  # [1, 3, 1, H, W]
-        # Pad the time axis to 2 × VAE_SCALE_T (i.e. trace_frames) so the
-        # VAE encoder, which was traced with that temporal shape, processes
-        # a complete window. The second latent frame is dropped later.
-        if image_tensor.shape[2] < VAE_SCALE_T * 2:
-            image_tensor = torch.cat(
-                [
-                    image_tensor,
-                    image_tensor[:, :, -1:].expand(1, 3, VAE_SCALE_T * 2 - image_tensor.shape[2], height, width),
-                ],
-                dim=2,
-            )
-        latent_cond = torch.from_numpy(
-            self.vae_encoder(image_tensor.float())[0],
-        )
-        latent_cond = latent_cond[:, :, :1]  # keep only the first frame
-        latent_mean = torch.tensor(LATENTS_MEAN).view(1, VAE_Z_DIM, 1, 1, 1)
-        latent_std = torch.tensor(LATENTS_STD).view(1, VAE_Z_DIM, 1, 1, 1)
+        # 2) Conditioning keyframe: the Stage-1 (global) call has no
+        # previously generated video, so - exactly like upstream
+        # ``gen_video_global.py`` (``keyframes[0] = input image``) - we
+        # anchor frame 0 to the reference image itself. The Stage-2 (local)
+        # call passes in the keyframe extracted from the Stage-1 video.
+        if keyframes is not None:
+            kf = keyframes[0, 0]  # [3, H, W] in [-1, 1], from extract_keyframes_from_global_video
+            kf_img = Image.fromarray(((kf.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 0).numpy())
+            keyframe_image = kf_img.resize((width, height), Image.BICUBIC)
+        else:
+            keyframe_image = refimage
+        clip_feature, y = self._encode_keyframe_conditioning(keyframe_image, num_frames, height, width)
 
-        # 3) Prepare latents and the first-frame mask.
+        # 3) Initial latents are pure noise; the model conditions on
+        # ``y``/``clip_feature``/``refimage_feature``/``music_feature``
+        # throughout denoising (no manual per-step re-blending - that is not
+        # how upstream's mask-based image conditioning works).
         latents = self._prepare_latents(num_frames, height, width, batch_size=1)
-        first_frame_mask = torch.ones_like(latents)
-        first_frame_mask[:, :, 0] = 0.0
-        latents = (1 - first_frame_mask) * (latent_cond - latent_mean) / latent_std + first_frame_mask * latents
 
         # 4) Music feature (broadcast across the batch).
         if music_feature is None:
-            music_feature = np.zeros((num_frames, 36), dtype=np.float32)
-        music_tensor = torch.from_numpy(music_feature)[None].to(torch.float16)  # [1, F, 36]
+            music_feature = np.zeros((num_frames, WAN_MUSIC_FEATURE_DIM), dtype=np.float32)
+        music_tensor = torch.from_numpy(music_feature)[None].to(torch.float16)  # [1, F, 35]
 
-        # 5) Pre-pack (or zero-pack) keyframe inputs for the Stage-2 path.
-        if keyframes is None:
-            keyframes = torch.zeros_like(latents)
-        if keyframes_mask is None:
-            keyframes_mask = torch.zeros_like(latents)
-
-        # 6) Denoise with FlowMatchScheduler (or skip if no DiT IR).
+        # 5) Denoise with FlowMatchScheduler (or skip if no DiT IR).
         if self.dit_ir_available:
             self.scheduler.set_timesteps(num_inference_steps)
             timesteps = self.scheduler.timesteps
 
             for t in timesteps:
-                latent_model_input = (1 - first_frame_mask) * (latent_cond - latent_mean) / latent_std + first_frame_mask * latents
                 timestep = torch.full((1,), float(t.item()), dtype=torch.float16)
-                run_kwargs = {
-                    "latents": latent_model_input.to(torch.float16),
-                    "timestep": timestep,
-                    "text_embeds": prompt_embeds.to(torch.float16),
-                    "image_embeds": image_embeds.to(torch.float16),
-                    "music_feature": music_tensor,
-                    "refimage": image_tensor.to(torch.float16),
-                    "keyframes": keyframes.to(torch.float16),
-                    "keyframes_mask": keyframes_mask.to(torch.float16),
-                }
-                noise_pred = torch.from_numpy(self.transformer(list(run_kwargs.values()))[0])
+                # Positional order must match `_DiTWrapper.forward`:
+                # (x, timestep, context, clip_feature, y, refimage_feature, music_feature)
+                run_inputs = [
+                    latents.to(torch.float16),
+                    timestep,
+                    prompt_embeds.to(torch.float16),
+                    clip_feature.to(torch.float16),
+                    y.to(torch.float16),
+                    refimage_feature.to(torch.float16),
+                    music_tensor,
+                ]
+                noise_pred = torch.from_numpy(self.transformer(run_inputs)[0])
                 if cfg_scale > 1.0:
-                    neg_kwargs = dict(run_kwargs)
-                    neg_kwargs["text_embeds"] = negative_embeds.to(torch.float16)
-                    noise_uncond = torch.from_numpy(self.transformer(list(neg_kwargs.values()))[0])
+                    neg_inputs = list(run_inputs)
+                    neg_inputs[2] = negative_embeds.to(torch.float16)
+                    noise_uncond = torch.from_numpy(self.transformer(neg_inputs)[0])
                     noise_pred = noise_uncond + cfg_scale * (noise_pred - noise_uncond)
                 latents = self.scheduler.step(noise_pred.float(), t, latents)[0]
         else:
@@ -1396,9 +1492,11 @@ class OVWanDancerPipeline(DiffusionPipeline):
             # notebook still produces a video file on CPU.
             print("⚠️ Skipping Denoise loop (no DiT IR); outputting raw-noise frame.")
 
-        # 7) Decode back into pixel space. Pad T to trace_frames so the
+        # 6) Decode back into pixel space. Pad T to trace_frames so the
         # VAE decoder (traced with T=trace_frames) processes a complete
         # temporal window — extra frames are dropped after decode.
+        latent_mean = torch.tensor(LATENTS_MEAN).view(1, VAE_Z_DIM, 1, 1, 1)
+        latent_std = torch.tensor(LATENTS_STD).view(1, VAE_Z_DIM, 1, 1, 1)
         latents = latents * latent_std + latent_mean
         if latents.shape[2] < VAE_SCALE_T:
             latents = torch.cat(
